@@ -1,10 +1,15 @@
 {
   "manifest_version": 3,
   "name": "Smart Form Filler",
-  "version": "1.0.0",
-  "description": "Auto-detect and fill forms with your saved information. Learns from forms you fill manually.",
-  "permissions": ["storage", "activeTab", "scripting"],
+  "version": "2.0.0",
+  "description": "Auto-detect and fill forms with your saved information. Multi-profile support, templates, AI-powered field matching.",
+  "permissions": ["storage", "activeTab", "scripting", "contextMenus", "tabs"],
+
   "host_permissions": ["<all_urls>"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com"
+  },
+
   "action": {
     "default_popup": "popup/popup.html",
     "default_icon": {
@@ -29,5 +34,21 @@
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
+  },
+  "commands": {
+    "trigger-fill": {
+      "suggested_key": {
+        "default": "Alt+F",
+        "mac": "Alt+F"
+      },
+      "description": "Fill the current form"
+    },
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Alt+Shift+F",
+        "mac": "Alt+Shift+F"
+      },
+      "description": "Open Smart Form Filler popup"
+    }
   }
 }

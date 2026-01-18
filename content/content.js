@@ -3,6 +3,8 @@
 
 (function() {
   'use strict';
+  
+  console.log('Smart Form Filler Content Script v2.1 Loaded');
 
   let storedData = null;
   let settings = null;
@@ -10,8 +12,11 @@
   let detectedFields = [];
   let hasScannedPage = false;
   let scanRetryCount = 0;
+  let currentProfile = 'personal';
+  let lockedProfiles = [];
   const MAX_RETRIES = 3;
   const RETRY_DELAY = 1500;
+  const autoFilledValues = new Map(); // Track auto-filled values for adaptive learning
 
   // Extended field patterns for better matching
   const FIELD_PATTERNS = {
@@ -173,6 +178,14 @@
   async function init() {
     await loadStoredData();
     
+    // Keyboard Shortcut (Alt+Shift+F)
+    document.addEventListener('keydown', (e) => {
+      if (e.altKey && e.shiftKey && e.code === 'KeyF') {
+        console.log('Form Filler: Shortcut triggered');
+        detectForms(true);
+      }
+    });
+    
     if (settings?.autoFillEnabled) {
       // Initial scan with retry
       scheduleFormScan();
@@ -195,6 +208,7 @@
       observeFormSubmissions();
     }
     
+    setupSmartSuggestions();
     chrome.runtime.onMessage.addListener(handleMessage);
   }
 
@@ -234,24 +248,34 @@
   // Load data from storage
   async function loadStoredData() {
     try {
-      const result = await chrome.storage.local.get(['formData', 'settings']);
+      const result = await chrome.storage.local.get(['formData', 'settings', 'lockedProfiles', 'currentProfile']);
       storedData = result.formData || {};
       settings = result.settings || { autoFillEnabled: true, showConfirmation: true, learnFromForms: true };
+      
+      lockedProfiles = result.lockedProfiles || [];
+      currentProfile = result.currentProfile || 'personal';
     } catch (error) {
       console.error('Form Filler: Error loading data', error);
     }
   }
 
-  // Handle messages
-  function handleMessage(request, sender, sendResponse) {
-    if (request.action === 'dataUpdated') {
-      storedData = request.formData;
-      settings = request.settings;
-    } else if (request.action === 'triggerFill') {
-      hasScannedPage = false;
-      detectForms();
+  // Handle messages from background
+  async function handleMessage(message, sender, sendResponse) {
+    if (message.action === 'dataUpdated') {
+      storedData = message.formData;
+      settings = message.settings;
+      if (message.lockedProfiles) lockedProfiles = message.lockedProfiles;
+      if (message.currentProfile) currentProfile = message.currentProfile;
+      console.log('Form Filler: Data updated from background');
+      if (!settings.guestMode) {
+        detectForms();
+      }
+    } else if (message.action === 'triggerFilling') {
+      console.log('Form Filler: Manual trigger received');
+      detectForms(true); // Force fill even if auto-fill setting is off or in guest mode
+    } else if (message.action === 'getPageText') {
+      sendResponse({ text: document.body.innerText.substring(0, 5000) });
     }
-    sendResponse({ success: true });
   }
 
   // Get site-specific config
@@ -266,7 +290,24 @@
   }
 
   // Detect forms on the page - now with Shadow DOM and iframe support
-  function detectForms() {
+  async function detectForms(force = false) {
+    // Check if domain is disabled
+    const { disabledDomains = [] } = await chrome.storage.local.get('disabledDomains');
+    if (disabledDomains.includes(window.location.hostname) && !force) {
+      console.log('Form Filler: Domain is disabled, skipping detection');
+      removeMagicFillIcons();
+      return;
+    }
+
+    // Guard against re-triggering if popup is already visible
+    if (confirmationPopup && !force) {
+      return;
+    }
+
+    if (settings?.guestMode && !force) {
+      console.log('Form Filler: Guest Mode is on, skipping auto-detection');
+      return;
+    }
     const siteConfig = getSiteConfig();
     const waitTime = siteConfig?.waitTime || 0;
     
@@ -283,11 +324,15 @@
       processInputs(allInputs, siteConfig);
       
       // Show popup if fields found
-      if (detectedFields.length > 0 && hasMatchingData()) {
-        if (settings?.showConfirmation) {
-          showConfirmationPopup();
-        } else {
-          fillFields();
+      if (detectedFields.length > 0) {
+        injectMagicFillIcons();
+        
+        if (hasMatchingData()) {
+          if (settings?.showConfirmation) {
+            showConfirmationPopup();
+          } else {
+            fillFields();
+          }
         }
       }
     }, waitTime);
@@ -502,17 +547,61 @@
     return str.toLowerCase().replace(/[^a-z0-9]/g, '');
   }
 
-  // Extract field name from input
+  // Extract field name from input - prioritize visible labels
   function extractFieldName(input) {
-    const sources = [input.name, input.id, getFieldLabel(input), input.placeholder].filter(Boolean);
-    
-    for (const source of sources) {
-      const cleaned = source.replace(/[^a-zA-Z0-9\s]/g, '').trim().toLowerCase().replace(/\s+/g, '_');
-      if (cleaned && cleaned.length >= 2 && cleaned.length < 50 && !/^(field|input|text|data|form|item|el|box|txt)\d*$/i.test(cleaned)) {
-        return cleaned;
-      }
+    // Priority 1: Visible label text (most reliable)
+    const labelText = getFieldLabel(input);
+    if (labelText && isValidFieldName(labelText)) {
+      return cleanFieldName(labelText);
     }
+    
+    // Priority 2: Placeholder (user-facing)
+    if (input.placeholder && isValidFieldName(input.placeholder)) {
+      return cleanFieldName(input.placeholder);
+    }
+    
+    // Priority 3: aria-label
+    const ariaLabel = input.getAttribute('aria-label');
+    if (ariaLabel && isValidFieldName(ariaLabel)) {
+      return cleanFieldName(ariaLabel);
+    }
+    
+    // Priority 4: name/id (only if not generic)
+    const name = input.name || input.id;
+    if (name && isValidFieldName(name) && !isGenericName(name)) {
+      return cleanFieldName(name);
+    }
+    
     return null;
+  }
+  
+  // Clean and normalize field name
+  function cleanFieldName(str) {
+    return str
+      .replace(/[^a-zA-Z0-9\s]/g, '')  // Remove special chars
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, '_')            // Spaces to underscores
+      .substring(0, 40);               // Limit length
+  }
+  
+  // Check if field name is valid
+  function isValidFieldName(str) {
+    if (!str) return false;
+    const cleaned = str.replace(/[^a-zA-Z]/g, '');
+    return cleaned.length >= 2 && cleaned.length < 50;
+  }
+  
+  // Check if name is generic (like field1, input7, etc.)
+  function isGenericName(name) {
+    const genericPatterns = [
+      /^(field|input|text|data|form|item|el|box|txt|q|answer|response|entry)[\d_-]*$/i,
+      /^[a-z]{1,3}\d+$/i,              // e.g., q1, a2, f7
+      /^\d+$/,                          // Pure numbers
+      /^(col|row|cell)[\d_-]*$/i,
+      /^form[\d_-]*(field|input)?[\d_-]*$/i
+    ];
+    return genericPatterns.some(pattern => pattern.test(name));
   }
 
   // Check if we have data for any detected fields
@@ -548,93 +637,488 @@
     return null;
   }
 
-  // Show confirmation popup
-  function showConfirmationPopup() {
+  // Show confirmation popup with partial fill checkboxes
+function showConfirmationPopup() {
+  if (confirmationPopup) {
+    confirmationPopup.remove();
+  }
+  
+  // Snapshot the current fields to prevent race conditions with background scans
+  const currentDetectedFields = [...detectedFields];
+  const fillableFields = currentDetectedFields.filter(f => getStoredValue(f.fieldKey, f.category));
+  if (fillableFields.length === 0) return;
+  
+  // Calculate confidence for each field
+  const fieldsWithConfidence = fillableFields.map(f => ({
+    ...f,
+    originalIndex: currentDetectedFields.indexOf(f),
+    value: getStoredValue(f.fieldKey, f.category),
+    confidence: calculateConfidence(f)
+  }));
+  
+  confirmationPopup = document.createElement('div');
+  confirmationPopup.id = 'smart-form-filler-popup';
+  confirmationPopup.innerHTML = `
+    <div class="sff-popup-content">
+      <div class="sff-popup-header">
+        <div class="sff-popup-logo">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect x="3" y="3" width="18" height="18" rx="3" stroke="url(#sff-gradient)" stroke-width="2"/>
+            <path d="M7 9h10M7 12h7M7 15h10" stroke="url(#sff-gradient)" stroke-width="2" stroke-linecap="round"/>
+            <defs>
+              <linearGradient id="sff-gradient" x1="3" y1="3" x2="21" y2="21" gradientUnits="userSpaceOnUse">
+                <stop stop-color="#7C3AED"/>
+                <stop offset="1" stop-color="#EC4899"/>
+              </linearGradient>
+            </defs>
+          </svg>
+          <span>Smart Form Filler</span>
+        </div>
+        <button class="sff-close-btn" id="sff-close">&times;</button>
+      </div>
+      <div class="sff-popup-body">
+        <div class="sff-select-all">
+          <label><input type="checkbox" id="sff-select-all" checked> Select all (${fillableFields.length} fields)</label>
+        </div>
+        <ul class="sff-field-list">
+          ${fieldsWithConfidence.slice(0, 8).map((f, i) => `
+            <li class="sff-field-item">
+              <label class="sff-field-checkbox">
+                <input type="checkbox" class="sff-field-check" data-index="${f.originalIndex}" checked>
+                <span class="sff-field-name">${formatFieldName(f.fieldKey)}</span>
+              </label>
+              <span class="sff-field-preview" title="${f.value}">${truncate(f.value, 15)}</span>
+              <span class="sff-confidence sff-confidence-${f.confidence}">${f.confidence === 'high' ? '✓' : f.confidence === 'medium' ? '~' : '?'}</span>
+            </li>
+          `).join('')}
+          ${fillableFields.length > 8 ? `<li class="sff-more">+${fillableFields.length - 8} more fields</li>` : ''}
+        </ul>
+      </div>
+      <div class="sff-popup-footer">
+        <button class="sff-btn sff-btn-secondary" id="sff-decline">Skip</button>
+        <button class="sff-btn sff-btn-primary" id="sff-accept">Fill Selected</button>
+      </div>
+    </div>
+  `;
+  
+  document.body.appendChild(confirmationPopup);
+  
+  // Select all checkbox
+  document.getElementById('sff-select-all').addEventListener('change', (e) => {
+    document.querySelectorAll('.sff-field-check').forEach(cb => cb.checked = e.target.checked);
+  });
+  
+  // Individual checkboxes update select all
+  document.querySelectorAll('.sff-field-check').forEach(cb => {
+    cb.addEventListener('change', () => {
+      const all = document.querySelectorAll('.sff-field-check');
+      const checked = document.querySelectorAll('.sff-field-check:checked');
+      document.getElementById('sff-select-all').checked = all.length === checked.length;
+    });
+  });
+  
+  document.getElementById('sff-accept').addEventListener('click', () => {
+    const selectedFields = Array.from(document.querySelectorAll('.sff-field-check:checked'))
+      .map(cb => currentDetectedFields[parseInt(cb.dataset.index)]);
+    fillSelectedFields(selectedFields);
+    confirmationPopup.remove();
+    confirmationPopup = null;
+  });
+  
+  document.getElementById('sff-decline').addEventListener('click', () => {
+    confirmationPopup.remove();
+    confirmationPopup = null;
+  });
+  
+  document.getElementById('sff-close').addEventListener('click', () => {
+    confirmationPopup.remove();
+    confirmationPopup = null;
+  });
+  
+  // Field Highlighting
+  document.querySelectorAll('.sff-field-item').forEach(item => {
+    const index = item.querySelector('.sff-field-check').dataset.index;
+    const field = currentDetectedFields[index];
+    
+    item.addEventListener('mouseenter', () => highlightField(field.element));
+    item.addEventListener('mouseleave', () => unhighlightField(field.element));
+  });
+
+  // Auto-dismiss after 30 seconds
+  setTimeout(() => {
     if (confirmationPopup) {
       confirmationPopup.remove();
+      confirmationPopup = null;
+    }
+  }, 30000);
+}
+
+function highlightField(element) {
+  if (element) {
+    element.style.outline = '3px solid #7C3AED';
+    element.style.outlineOffset = '2px';
+    element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+}
+
+function unhighlightField(element) {
+  if (element) {
+    element.style.outline = 'none';
+  }
+}
+
+// Smart Suggestions
+function setupSmartSuggestions() {
+  document.addEventListener('focusin', (e) => {
+    if (shouldSkipInput(e.target) || e.target.type === 'password') return;
+    if (e.target.value) return; // Only suggest for empty fields
+    
+    const context = identifyField(e.target, getSiteConfig());
+    if (context) {
+      showSuggestions(e.target, context.key, context.category);
+    }
+  });
+
+  document.addEventListener('focusout', (e) => {
+    setTimeout(() => {
+      const suggestions = document.getElementById('sff-suggestions');
+      if (suggestions && !suggestions.contains(document.activeElement)) {
+        suggestions.remove();
+      }
+    }, 200);
+  });
+}
+
+function showSuggestions(element, fieldKey, category) {
+  const existing = document.getElementById('sff-suggestions');
+  if (existing) existing.remove();
+
+  const value = getStoredValue(fieldKey, category);
+  if (!value) return;
+
+  const suggestions = document.createElement('div');
+  suggestions.id = 'sff-suggestions';
+  suggestions.innerHTML = `
+    <div class="sff-suggestion-item" tabindex="0">
+      <span class="sff-suggestion-value">${truncate(value, 20)}</span>
+      <span class="sff-suggestion-label">Fill ${formatFieldName(fieldKey)}</span>
+    </div>
+  `;
+
+  const rect = element.getBoundingClientRect();
+  suggestions.style.top = `${window.scrollY + rect.bottom + 5}px`;
+  suggestions.style.left = `${window.scrollX + rect.left}px`;
+  suggestions.style.width = `${Math.max(rect.width, 150)}px`;
+
+  document.body.appendChild(suggestions);
+
+  suggestions.onclick = () => {
+    setFieldValue(element, value);
+    suggestions.remove();
+  };
+}  
+
+  // Calculate confidence score for field match
+  function calculateConfidence(field) {
+    const identifier = field.originalIdentifier || '';
+    const fieldKey = field.fieldKey || '';
+    
+    // High confidence: exact pattern match in identifier
+    const exactPatterns = FIELD_PATTERNS[fieldKey];
+    if (exactPatterns && exactPatterns.some(p => p.test(identifier))) {
+      return 'high';
     }
     
-    const fillableFields = detectedFields.filter(f => getStoredValue(f.fieldKey, f.category));
-    if (fillableFields.length === 0) return;
+    // High confidence: input type matches (email, tel, url)
+    const element = field.element;
+    if (element && (
+      (element.type === 'email' && fieldKey === 'email') ||
+      (element.type === 'tel' && fieldKey === 'phone') ||
+      (element.type === 'url' && ['website', 'linkedin', 'github'].includes(fieldKey))
+    )) {
+      return 'high';
+    }
     
-    confirmationPopup = document.createElement('div');
-    confirmationPopup.id = 'smart-form-filler-popup';
-    confirmationPopup.innerHTML = `
-      <div class="sff-popup-content">
-        <div class="sff-popup-header">
-          <div class="sff-popup-logo">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-              <rect x="3" y="3" width="18" height="18" rx="3" stroke="url(#sff-gradient)" stroke-width="2"/>
-              <path d="M7 9h10M7 12h7M7 15h10" stroke="url(#sff-gradient)" stroke-width="2" stroke-linecap="round"/>
-              <defs>
-                <linearGradient id="sff-gradient" x1="3" y1="3" x2="21" y2="21" gradientUnits="userSpaceOnUse">
-                  <stop stop-color="#7C3AED"/>
-                  <stop offset="1" stop-color="#EC4899"/>
-                </linearGradient>
-              </defs>
-            </svg>
-            <span>Smart Form Filler</span>
-          </div>
-          <button class="sff-close-btn" id="sff-close">&times;</button>
-        </div>
-        <div class="sff-popup-body">
-          <p>Found <strong>${fillableFields.length}</strong> fields to fill</p>
-          <ul class="sff-field-list">
-            ${fillableFields.slice(0, 6).map(f => {
-              const value = getStoredValue(f.fieldKey, f.category);
-              return `<li><span class="sff-field-name">${formatFieldName(f.fieldKey)}</span><span class="sff-field-preview">${truncate(value, 18)}</span></li>`;
-            }).join('')}
-            ${fillableFields.length > 6 ? `<li class="sff-more">+${fillableFields.length - 6} more fields</li>` : ''}
-          </ul>
-        </div>
-        <div class="sff-popup-footer">
-          <button class="sff-btn sff-btn-secondary" id="sff-decline">Skip</button>
-          <button class="sff-btn sff-btn-primary" id="sff-accept">Fill Form</button>
-        </div>
-      </div>
-    `;
+    // Medium confidence: fuzzy match or stored data match
+    const normalizedId = normalizeFieldName(identifier);
+    const normalizedKey = normalizeFieldName(fieldKey);
+    if (normalizedId.includes(normalizedKey) || normalizedKey.includes(normalizedId)) {
+      return 'medium';
+    }
     
-    document.body.appendChild(confirmationPopup);
-    
-    document.getElementById('sff-accept').addEventListener('click', () => {
-      fillFields();
-      confirmationPopup.remove();
-      confirmationPopup = null;
-    });
-    
-    document.getElementById('sff-decline').addEventListener('click', () => {
-      confirmationPopup.remove();
-      confirmationPopup = null;
-    });
-    
-    document.getElementById('sff-close').addEventListener('click', () => {
-      confirmationPopup.remove();
-      confirmationPopup = null;
-    });
-    
-    // Auto-dismiss after 30 seconds
-    setTimeout(() => {
-      if (confirmationPopup) {
-        confirmationPopup.remove();
-        confirmationPopup = null;
-      }
-    }, 30000);
+    // Low confidence: new/unknown field
+    return 'low';
   }
 
-  // Fill the detected fields
-  function fillFields() {
-    let filledCount = 0;
-    detectedFields.forEach(field => {
-      const value = getStoredValue(field.fieldKey, field.category);
-      if (value) {
-        setFieldValue(field.element, value);
-        filledCount++;
-      }
-    });
-    console.log(`Form Filler: Filled ${filledCount} fields`);
+  // Fill the detected fields (all)
+function fillFields() {
+  let filledCount = 0;
+  detectedFields.forEach(field => {
+    const value = getStoredValue(field.fieldKey, field.category);
+    if (value) {
+      setFieldValue(field.element, value);
+      trackAutoFilledValue(field, value);
+      filledCount++;
+    }
+  });
+  console.log(`Form Filler: Filled ${filledCount} fields`);
+}
+
+// Fill only selected fields (Accepts field objects now)
+function fillSelectedFields(fields) {
+  let filledCount = 0;
+  if (!Array.isArray(fields)) {
+    console.error('Form Filler: Invalid fields passed to fillSelectedFields');
+    return;
   }
 
-  // Set field value with framework support
+  fields.forEach(field => {
+    // Robust check for field validity
+    if (!field || typeof field !== 'object' || !field.fieldKey) {
+      console.warn('Form Filler: Skipping invalid field in selection', field);
+      return;
+    }
+
+    const value = getStoredValue(field.fieldKey, field.category);
+    if (value) {
+      setFieldValue(field.element, value);
+      trackAutoFilledValue(field, value);
+      filledCount++;
+    }
+  });
+  console.log(`Form Filler: Filled ${filledCount} selected fields`);
+}
+
+function trackAutoFilledValue(field, value) {
+  autoFilledValues.set(field.element, {
+    originalValue: value,
+    fieldKey: field.fieldKey,
+    category: field.category
+  });
+  
+  // Add listener for changes (adaptive learning)
+  field.element.addEventListener('blur', handleFieldUpdate);
+}
+
+async function handleFieldUpdate(e) {
+  const element = e.target;
+  const tracked = autoFilledValues.get(element);
+  if (!tracked) return;
+  
+  const newValue = element.value?.trim();
+  if (newValue && newValue !== tracked.originalValue) {
+    showCorrectionPrompt(element, tracked.fieldKey, tracked.category, newValue);
+  }
+}
+
+function showCorrectionPrompt(element, fieldKey, category, newValue) {
+  // Remove existing prompt if any
+  const existing = document.getElementById('sff-correction-prompt');
+  if (existing) existing.remove();
+  
+  const prompt = document.createElement('div');
+  prompt.id = 'sff-correction-prompt';
+  prompt.innerHTML = `
+    <span>Update saved ${formatFieldName(fieldKey)}?</span>
+    <button id="sff-update-yes">Update</button>
+    <button id="sff-update-no">No</button>
+  `;
+  
+  const rect = element.getBoundingClientRect();
+  prompt.style.top = `${window.scrollY + rect.bottom + 5}px`;
+  prompt.style.left = `${window.scrollX + rect.left}px`;
+  
+  document.body.appendChild(prompt);
+  
+  document.getElementById('sff-update-yes').onclick = async () => {
+    await updateStoredData(category, fieldKey, newValue);
+    autoFilledValues.set(element, { ...tracked, originalValue: newValue });
+    prompt.remove();
+  };
+  
+  document.getElementById('sff-update-no').onclick = () => {
+    prompt.remove();
+  };
+  
+  // Auto-hide after 5 seconds
+  setTimeout(() => prompt?.remove(), 5000);
+}
+
+async function updateStoredData(category, fieldKey, value) {
+  try {
+    const result = await chrome.storage.local.get('formData');
+    const data = result.formData || {};
+    
+    if (!data[category]) data[category] = {};
+    data[category][fieldKey] = value;
+    
+    await chrome.storage.local.set({ formData: data });
+    storedData = data;
+    
+    // Notify background/popup
+    chrome.runtime.sendMessage({ action: 'dataUpdated', formData: data, settings });
+    console.log(`Form Filler: Updated ${category}.${fieldKey} via adaptive learning`);
+  } catch (error) {
+    console.error('Error updating data:', error);
+  }
+}
+
+  // Magic Fill Icon Logic
+// Magic Fill & AI Generation Icon Logic
+function injectMagicFillIcons() {
+  removeMagicFillIcons();
+  
+  detectedFields.forEach(field => {
+    if (field.element.tagName === 'SELECT' || field.element.disabled || field.element.readOnly) return;
+    
+    const container = field.element.parentElement;
+    if (!container) return;
+    
+    // Ensure container is relative for positioning
+    const style = window.getComputedStyle(container);
+    if (style.position === 'static') {
+      container.style.position = 'relative';
+    }
+    
+    const value = getStoredValue(field.fieldKey, field.category);
+    const isAiTarget = !value && (field.element.tagName === 'TEXTAREA' || field.element.type === 'text');
+    
+    const icon = document.createElement('div');
+    icon.className = isAiTarget ? 'sff-ai-icon' : 'sff-magic-icon';
+    icon.title = isAiTarget ? 'AI Draft' : 'Smart Fill';
+    
+    if (settings?.showMagicIcon === false && !isAiTarget) return;
+
+    if (isAiTarget) {
+      icon.innerHTML = '✨';
+      icon.onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        handleAIGeneration(field);
+      };
+    } else {
+      icon.innerHTML = `
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect x="3" y="3" width="18" height="18" rx="3" stroke="currentColor" stroke-width="2"/>
+          <path d="M7 9h10M7 12h7M7 15h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+      `;
+      icon.onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        detectForms(true); // Force fill flow
+      };
+
+      // Visibility Behavior
+      if (settings?.magicIconBehavior === 'hover') {
+        icon.classList.add('invisible');
+        // Show on icon hover (handled by CSS) or field hover
+        const show = () => icon.classList.add('visible');
+        const hide = () => icon.classList.remove('visible');
+        
+        container.addEventListener('mouseenter', show);
+        container.addEventListener('mouseleave', hide);
+        field.element.addEventListener('focus', show);
+        field.element.addEventListener('blur', () => setTimeout(hide, 200));
+      } else if (settings?.magicIconBehavior === 'focus') {
+        icon.classList.add('invisible');
+        const show = () => icon.classList.add('visible');
+        const hide = () => icon.classList.remove('visible');
+        
+        field.element.addEventListener('focus', show);
+        field.element.addEventListener('blur', () => setTimeout(hide, 200));
+      }
+    }
+    
+    // Position icon
+    const rect = field.element.getBoundingClientRect();
+    const containerRect = container.getBoundingClientRect();
+    icon.style.top = `${rect.top - containerRect.top + (rect.height - 18) / 2}px`;
+    icon.style.left = `${rect.right - containerRect.left - 24}px`;
+    
+    container.appendChild(icon);
+  });
+}
+
+async function handleAIGeneration(field) {
+  if (!settings?.geminiApiKey) {
+    alert('Please set your Gemini API key in the extension settings to use AI generation.');
+    return;
+  }
+
+  const icon = field.element.parentElement.querySelector('.sff-ai-icon');
+  if (icon) {
+    icon.innerHTML = '⏳';
+    icon.classList.add('loading');
+  }
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      action: 'generateField',
+      field: {
+        label: field.label,
+        name: field.name,
+        placeholder: field.placeholder,
+        type: field.type
+      },
+      profileData: storedData,
+      apiKey: settings.geminiApiKey
+    });
+
+    if (response.success && response.result) {
+      showAIDraftPrompt(field.element, response.result, field.fieldKey, field.category);
+    } else {
+      console.error('AI Generation failed:', response.error);
+    }
+  } catch (error) {
+    console.error('AI Generation error:', error);
+  } finally {
+    if (icon) {
+      icon.innerHTML = '✨';
+      icon.classList.remove('loading');
+    }
+  }
+}
+
+function showAIDraftPrompt(element, draft, fieldKey, category) {
+  removeAIDraftPrompt();
+  
+  const prompt = document.createElement('div');
+  prompt.id = 'sff-ai-draft-prompt';
+  prompt.innerHTML = `
+    <div class="sff-ai-draft-header">✨ AI Recommended Draft</div>
+    <div class="sff-ai-draft-body">${draft}</div>
+    <div class="sff-ai-draft-footer">
+      <button id="sff-ai-apply">Apply Draft</button>
+      <button id="sff-ai-decline">Cancel</button>
+    </div>
+  `;
+  
+  const rect = element.getBoundingClientRect();
+  prompt.style.top = `${window.scrollY + rect.top - 120}px`;
+  prompt.style.left = `${window.scrollX + rect.left}px`;
+  prompt.style.width = `${Math.max(rect.width, 300)}px`;
+  
+  document.body.appendChild(prompt);
+  
+  document.getElementById('sff-ai-apply').onclick = () => {
+    setFieldValue(element, draft);
+    updateStoredData(category, fieldKey, draft); // Save for future use
+    prompt.remove();
+  };
+  
+  document.getElementById('sff-ai-decline').onclick = () => prompt.remove();
+}
+
+function removeAIDraftPrompt() {
+  document.getElementById('sff-ai-draft-prompt')?.remove();
+}
+
+function removeMagicFillIcons() {
+  document.querySelectorAll('.sff-magic-icon, .sff-ai-icon').forEach(el => el.remove());
+}
+
+// Set field value with framework support
   function setFieldValue(element, value) {
     if (element.tagName === 'SELECT') {
       const options = Array.from(element.options);
@@ -680,15 +1164,24 @@
       let shouldCheck = false;
       
       mutations.forEach(mutation => {
-        mutation.addedNodes.forEach(node => {
-          if (node.nodeType === Node.ELEMENT_NODE) {
-            if (node.matches?.('form, input, select, textarea, [role="form"]') ||
-                node.querySelector?.('form, input, select, textarea')) {
-              shouldCheck = true;
-            }
+      mutation.addedNodes.forEach(node => {
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          // Ignore our own extension elements to prevent feedback loops
+          if (node.id === 'smart-form-filler-popup' || node.id === 'sff-ai-draft-prompt' || 
+              node.classList.contains('sff-magic-icon') || node.classList.contains('sff-ai-icon')) {
+            return;
           }
-        });
+
+          if (node.matches?.('form, input, select, textarea, [role="form"]') ||
+              node.querySelector?.('form, input, select, textarea')) {
+            // Further verify it's not our own input being detected
+            if (node.closest?.('#smart-form-filler-popup, #sff-ai-draft-prompt')) return;
+            
+            shouldCheck = true;
+          }
+        }
       });
+    });
       
       if (shouldCheck) {
         clearTimeout(debounceTimer);
@@ -741,31 +1234,75 @@
     return null;
   }
 
-  // Learn from filled form
+  // Learn from filled form - with Gemini AI validation
   async function learnFromForm(form) {
-    if (!form) return;
+    // Check if profile is locked
+    if (lockedProfiles.includes(currentProfile)) {
+      console.log('Form Filler: Profile locked, skipping learning');
+      return;
+    }
+    
+    if (!form || settings?.guestMode) return;
     
     const inputs = form.querySelectorAll('input, select, textarea');
+    const fieldsToLearn = [];
+    
+    // Collect all filled fields with their context
+    inputs.forEach((input, index) => {
+      if (shouldSkipInput(input) || input.type === 'password' || !input.value?.trim()) return;
+      
+      const label = getFieldLabel(input);
+      const value = input.value.trim();
+      
+      fieldsToLearn.push({
+        index,
+        element: input,
+        label: label || input.placeholder || input.name || input.id || `field_${index}`,
+        value,
+        name: input.name,
+        id: input.id,
+        placeholder: input.placeholder,
+        type: input.type
+      });
+    });
+    
+    if (fieldsToLearn.length === 0) return;
+    
+    // Try to validate with Gemini AI
+    let validatedFields = null;
+    if (settings?.geminiApiKey) {
+      validatedFields = await validateFieldsWithGemini(fieldsToLearn);
+    }
+    
+    // Process fields (use Gemini results if available, otherwise use local detection)
     const newData = {};
     let learnedCount = 0;
     
-    inputs.forEach(input => {
-      if (shouldSkipInput(input) || input.type === 'password' || !input.value?.trim()) return;
+    for (const field of fieldsToLearn) {
+      let fieldKey, category;
       
-      const match = identifyField(input, getSiteConfig());
-      if (!match) return;
-      
-      const { key, category } = match;
-      const value = input.value.trim();
+      if (validatedFields && validatedFields[field.index]) {
+        // Use Gemini's categorization
+        const geminiResult = validatedFields[field.index];
+        fieldKey = geminiResult.fieldName;
+        category = geminiResult.category;
+      } else {
+        // Fallback to local detection
+        const match = identifyField(field.element, getSiteConfig());
+        if (!match) continue;
+        fieldKey = match.key;
+        category = match.category;
+      }
       
       // Skip if same value already exists
-      if (storedData[category]?.[key] === value) return;
+      if (storedData[category]?.[fieldKey] === field.value) continue;
       
       if (!newData[category]) newData[category] = {};
-      newData[category][key] = value;
+      newData[category][fieldKey] = field.value;
       learnedCount++;
-    });
+    }
     
+    // Save learned data
     if (Object.keys(newData).length > 0) {
       const updatedData = { ...storedData };
       for (const [category, fields] of Object.entries(newData)) {
@@ -775,11 +1312,40 @@
       try {
         await chrome.storage.local.set({ formData: updatedData });
         storedData = updatedData;
-        console.log(`Form Filler: Learned ${learnedCount} fields`, newData);
+        console.log(`Form Filler: Learned ${learnedCount} fields (Gemini: ${validatedFields ? 'yes' : 'no'})`, newData);
+        
+        // Notify popup to sync to cloud
+        chrome.runtime.sendMessage({ action: 'dataUpdated', formData: updatedData, settings });
       } catch (error) {
         console.error('Form Filler: Error saving', error);
       }
     }
+  }
+  
+  // Validate fields with Gemini AI
+  async function validateFieldsWithGemini(fields) {
+    try {
+      const response = await chrome.runtime.sendMessage({
+        action: 'validateFormFields',
+        fields: fields.map(f => ({
+          index: f.index,
+          label: f.label,
+          value: f.value,
+          name: f.name,
+          id: f.id,
+          placeholder: f.placeholder,
+          type: f.type
+        })),
+        apiKey: settings.geminiApiKey
+      });
+      
+      if (response?.success && response.results) {
+        return response.results;
+      }
+    } catch (error) {
+      console.error('Form Filler: Gemini validation error', error);
+    }
+    return null;
   }
 
   // Utilities

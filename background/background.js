@@ -14,6 +14,7 @@ chrome.runtime.onInstalled.addListener(async (details) => {
       },
       settings: {
         autoFillEnabled: true,
+        guestMode: false,
         showConfirmation: true,
         learnFromForms: true,
         geminiApiKey: ''
@@ -21,6 +22,17 @@ chrome.runtime.onInstalled.addListener(async (details) => {
     });
     console.log('Smart Form Filler installed');
   }
+  
+  // Create context menu (on install and update)
+  try {
+    await chrome.contextMenus.remove('fill-form').catch(() => {});
+  } catch (e) {}
+  
+  chrome.contextMenus.create({
+    id: 'fill-form',
+    title: 'Fill Form with Smart Form Filler',
+    contexts: ['editable', 'page']
+  });
 });
 
 // Listen for messages
@@ -28,6 +40,26 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   handleMessage(request, sender, sendResponse);
   return true;
 });
+
+// Listen for keyboard shortcuts
+chrome.commands.onCommand.addListener((command) => {
+  if (command === 'trigger-fill') {
+    triggerFillingInActiveTab();
+  }
+});
+
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+  if (info.menuItemId === 'fill-form') {
+    triggerFillingInActiveTab();
+  }
+});
+
+async function triggerFillingInActiveTab() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (tab?.id) {
+    chrome.tabs.sendMessage(tab.id, { action: 'triggerFilling' }).catch(() => {});
+  }
+}
 
 // Handle messages
 async function handleMessage(request, sender, sendResponse) {
@@ -51,6 +83,32 @@ async function handleMessage(request, sender, sendResponse) {
       case 'getStoredData':
         const data = await chrome.storage.local.get(['formData', 'settings']);
         sendResponse({ success: true, data });
+        break;
+
+      case 'validateFormFields':
+        const validated = await validateFormFieldsWithGemini(request.fields, request.apiKey);
+        sendResponse({ success: true, results: validated });
+        break;
+
+      case 'generateField':
+        const generatedText = await generateFieldWithGemini(request.field, request.profileData, request.apiKey);
+        sendResponse({ success: true, result: generatedText });
+        break;
+
+      case 'extractFromDocument':
+        const docResult = await extractFromDocumentWithGemini(request.fileData, request.mimeType, request.apiKey);
+        sendResponse({ success: true, result: docResult });
+        break;
+
+      case 'generateCoverLetter':
+        const letter = await generateCoverLetterWithGemini(request.jobDescription, request.profileData, request.tone, request.apiKey);
+        sendResponse({ success: true, result: letter });
+        break;
+        break;
+
+      case 'extractFromUrl':
+        const urlResult = await extractFromUrlWithGemini(request.url, request.apiKey);
+        sendResponse({ success: true, result: urlResult });
         break;
 
       default:
@@ -80,11 +138,12 @@ async function analyzeFieldsWithGemini(fields, apiKey) {
     `${i + 1}. name="${f.name || 'N/A'}", id="${f.id || 'N/A'}", placeholder="${f.placeholder || 'N/A'}", label="${f.label || 'N/A'}", type="${f.type || 'text'}"`
   ).join('\n');
 
-  const prompt = `You are a form field analyzer. Given these HTML form fields:
+  const prompt = `You are a form field analyzer. Given these HTML form fields (which may be in any language like Spanish, French, Hindi, etc.):
 
 ${fieldDescriptions}
 
-For each field, determine what type of personal data it expects. Return a JSON object where keys are the field numbers (1, 2, 3...) and values are the data type from this list:
+For each field, determine what type of personal data it expects. Translate any non-English labels or placeholders to understand the context.
+Return a JSON object where keys are the field numbers (1, 2, 3...) and values are the data type from this list:
 firstName, lastName, fullName, middleName, email, phone, alternateEmail, alternatePhone, street, apartment, city, state, zip, country, company, jobTitle, department, linkedin, website, github, university, degree, major, gpa, graduationYear, experience, salary, skills, bio, dob, gender, nationality, or "unknown" if unclear.
 
 Example response: {"1": "firstName", "2": "email", "3": "unknown"}
@@ -92,7 +151,7 @@ Example response: {"1": "firstName", "2": "email", "3": "unknown"}
 Return ONLY the JSON object, no other text.`;
 
   try {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -126,7 +185,7 @@ async function suggestCategoryWithGemini(fieldName, apiKey) {
 Reply with ONLY one word from: personal, contact, address, education, professional, other`;
 
   try {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -147,27 +206,221 @@ Reply with ONLY one word from: personal, contact, address, education, profession
   }
 }
 
-// Context menu for quick fill
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.contextMenus?.create({
-    id: 'fill-form',
-    title: 'Fill this form',
-    contexts: ['page', 'editable']
-  });
-});
+// Validate form fields with Gemini - categorize each field properly
+async function validateFormFieldsWithGemini(fields, apiKey) {
+  if (!apiKey || !fields?.length) return null;
 
-chrome.contextMenus?.onClicked.addListener((info, tab) => {
-  if (info.menuItemId === 'fill-form' && tab?.id) {
-    chrome.tabs.sendMessage(tab.id, { action: 'triggerFill' });
-  }
-});
+  const fieldDescriptions = fields.map((f, i) => 
+    `${f.index}. Label: "${f.label}", Value: "${f.value}", Name: "${f.name || ''}", Placeholder: "${f.placeholder || ''}"`
+  ).join('\n');
 
-// Keyboard shortcut
-chrome.commands?.onCommand?.addListener(async (command) => {
-  if (command === 'trigger-fill') {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.id) {
-      chrome.tabs.sendMessage(tab.id, { action: 'triggerFill' });
+  const prompt = `You are a form field categorizer. Given these filled form fields with their labels and values:
+
+${fieldDescriptions}
+
+For each field, determine:
+1. The proper field name (like firstName, lastName, email, phone, jobTitle, company, university, degree, etc.)
+2. The category (personal, contact, address, education, professional, or other)
+
+Return a JSON object where keys are the field indices and values are objects with "fieldName" and "category".
+
+Example input:
+0. Label: "Full Name", Value: "John Doe"
+1. Label: "Work Email", Value: "john@company.com"
+2. Label: "Current Role", Value: "Software Engineer"
+
+Example output:
+{"0": {"fieldName": "fullName", "category": "personal"}, "1": {"fieldName": "email", "category": "contact"}, "2": {"fieldName": "jobTitle", "category": "professional"}}
+
+Rules:
+- Use camelCase for fieldName (e.g., firstName, jobTitle, graduationYear)
+- Categories: personal (name, dob, gender), contact (email, phone), address (street, city, zip, country), education (university, degree, gpa), professional (company, jobTitle, linkedin), other (everything else)
+- Return ONLY the JSON object, no markdown, no explanation.`;
+
+  try {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.1, maxOutputTokens: 1000 }
+      })
+    });
+
+    if (!response.ok) throw new Error('Gemini API request failed');
+
+    const data = await response.json();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+    
+    // Extract JSON from response
+    const jsonMatch = text?.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const result = JSON.parse(jsonMatch[0]);
+      console.log('Gemini validated fields:', result);
+      return result;
     }
+    return null;
+  } catch (error) {
+    console.error('Gemini validation error:', error);
+    return null;
   }
-});
+}
+
+// Generate field content with Gemini based on profile
+async function generateFieldWithGemini(field, profileData, apiKey) {
+  if (!apiKey) return null;
+
+  const profileSummary = JSON.stringify(profileData);
+  const prompt = `You are an AI assistant helping a user fill a form. 
+Based on the user's profile data:
+${profileSummary}
+
+Generate a professional and concise response for the form field:
+Label: "${field.label}"
+Name: "${field.name || ''}"
+Placeholder: "${field.placeholder || ''}"
+Type: "${field.type || 'text'}"
+
+Rules:
+- If it's a short field (like "Job Title" or "City"), provide a 1-3 word answer.
+- If it's a long field (like "Bio" or "Cover Letter"), provide a 1-2 paragraph professional response.
+- Use ONLY the information provided in the profile. If info is missing, make a polite, generic placeholder or skip.
+- Return ONLY the generated text, no explanation or conversational filler.`;
+
+  try {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.7, maxOutputTokens: 500 }
+      })
+    });
+
+    if (!response.ok) throw new Error('Gemini API request failed');
+
+    const data = await response.json();
+    return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null;
+  } catch (error) {
+    console.error('Gemini generation error:', error);
+    return null;
+  }
+}
+
+// Extract profile data from documents/images using Gemini Multi-modal
+async function extractFromDocumentWithGemini(fileData, mimeType, apiKey) {
+  if (!apiKey) return null;
+
+  const prompt = `Extract all relevant personal and professional information from this document to populate a user profile.
+Identify: Full Name, Email, Phone, Address, Job Title, Company, Skills, Education (School, Degree, GPA), and Bio.
+Return the data as a structured JSON object with categories: personal, contact, address, professional, education.
+Only include fields you are confident about. Return VALID JSON only.`;
+
+  try {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{
+          parts: [
+            { text: prompt },
+            {
+              inline_data: {
+                mime_type: mimeType,
+                data: fileData // Base64 string
+              }
+            }
+          ]
+        }],
+        generationConfig: { 
+          temperature: 0.1, 
+          response_mime_type: "application/json" 
+        }
+      })
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('Gemini API Error Detail:', errorText);
+      throw new Error(`Gemini API request failed: ${response.status} ${response.statusText} - ${errorText}`);
+    }
+
+    const data = await response.json();
+    const resultText = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+    return JSON.parse(resultText);
+  } catch (error) {
+    console.error('Gemini document extraction error:', error);
+    return null;
+  }
+}
+
+// Extract profile data from a LinkedIn URL using Gemini
+async function extractFromUrlWithGemini(url, apiKey) {
+  if (!apiKey) return null;
+
+  const prompt = `Visit or analyze this LinkedIn profile URL: ${url}
+Extract: Name, Current Role, Current Company, Education, and Skills.
+Return the data as a structured JSON object with categories: personal, professional, education.
+If you cannot access the link, extract whatever possible from the URL structure or common knowledge if it's a public figure, otherwise return empty JSON.
+Return VALID JSON only.`;
+
+  try {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { 
+          temperature: 0.1, 
+          response_mime_type: "application/json" 
+        }
+      })
+    });
+
+    if (!response.ok) throw new Error('Gemini API request failed');
+
+    const data = await response.json();
+    const resultText = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+    return JSON.parse(resultText);
+  } catch (error) {
+    console.error('Gemini URL extraction error:', error);
+    return null;
+  }
+}
+
+// Generate Cover Letter
+async function generateCoverLetterWithGemini(jobDescription, profileData, tone, apiKey) {
+  if (!apiKey) return 'Please set your Gemini API key in settings.';
+
+  const prompt = `
+    Write a ${tone} cover letter for the following job description.
+    
+    My Profile:
+    ${JSON.stringify(profileData, null, 2)}
+    
+    Job Description:
+    ${jobDescription}
+    
+    Keep it concise (under 300 words). Focus on relevant skills.
+    Do not include placeholders like "[Your Name]" if possible, use the name from my profile.
+  `;
+
+  try {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.7, maxOutputTokens: 800 }
+      })
+    });
+
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error?.message || 'API Error');
+    
+    return data.candidates[0].content.parts[0].text.trim();
+  } catch (error) {
+    console.error('Cover Letter Gen Error:', error);
+    return `Error generating cover letter: ${error.message}`;
+  }
+}
