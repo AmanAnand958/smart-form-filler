@@ -226,10 +226,8 @@
           
           <div class="form-group">
             <label for="linkedinUrl">LinkedIn Profile Link</label>
-            <div class="input-with-btn">
-              <input type="text" id="linkedinUrl" placeholder="https://www.linkedin.com/in/username">
-              <button id="extractUrlBtn" class="btn btn-primary btn-small">Extract</button>
-            </div>
+            <input type="text" id="linkedinUrl" placeholder="https://www.linkedin.com/in/username" style="width: 100%; min-width: 250px;">
+            <button id="extractUrlBtn" class="btn btn-primary btn-small" style="margin-top: 8px; width: 100%;">✨ Extract Data</button>
           </div>
         </div>
 
@@ -356,6 +354,12 @@
               Show Magic Fill Icon
             </label>
           </div>
+          <div class="form-group checkbox-group">
+            <label>
+              <input type="checkbox" id="showHUD" checked>
+              Show Floating HUD
+            </label>
+          </div>
           <div class="form-group" style="margin-top: 8px;">
             <label for="magicIconBehavior" style="font-size: 12px;">Icon Behavior</label>
             <select id="magicIconBehavior" class="select-small">
@@ -365,18 +369,6 @@
             </select>
           </div>
         </div>
-
-        <!-- Data Management -->
-        <div class="settings-section">
-          <h4>Data</h4>
-          <div class="actions">
-            <button id="exportData" class="btn btn-secondary">📤 Export</button>
-            <button id="importData" class="btn btn-secondary">📥 Import</button>
-            <button id="clearData" class="btn btn-danger">🗑️ Clear</button>
-          </div>
-        </div>
-        <input type="file" id="importFile" accept=".json" class="hidden">
-
 
         <!-- Onboarding -->
         <div class="settings-section">

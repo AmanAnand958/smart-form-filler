@@ -17,23 +17,86 @@ chrome.runtime.onInstalled.addListener(async (details) => {
         guestMode: false,
         showConfirmation: true,
         learnFromForms: true,
+        showHUD: true,
         geminiApiKey: ''
       }
     });
     console.log('Smart Form Filler installed');
   }
   
-  // Create context menu (on install and update)
-  try {
-    await chrome.contextMenus.remove('fill-form').catch(() => {});
-  } catch (e) {}
-  
-  chrome.contextMenus.create({
-    id: 'fill-form',
-    title: 'Fill Form with Smart Form Filler',
-    contexts: ['editable', 'page']
-  });
+  // Create context menus
+  createContextMenus();
 });
+
+// Function to create initial context menus
+function createContextMenus() {
+  chrome.contextMenus.removeAll(() => {
+    // Root menu
+    chrome.contextMenus.create({
+      id: 'sff-root',
+      title: 'Smart Fill',
+      contexts: ['editable', 'page']
+    });
+
+    chrome.contextMenus.create({
+      id: 'fill-form',
+      parentId: 'sff-root',
+      title: 'Fill All Fields',
+      contexts: ['editable', 'page']
+    });
+
+    chrome.contextMenus.create({
+      id: 'map-field',
+      parentId: 'sff-root',
+      title: 'Map this field to...',
+      contexts: ['editable']
+    });
+
+    // Categories
+    const categories = {
+      'personal': 'Personal Info',
+      'contact': 'Contact Info',
+      'address': 'Address Details',
+      'education': 'Education',
+      'professional': 'Professional',
+      'other': 'Other Skills/Bio'
+    };
+
+    const fields = {
+      'personal': ['firstName', 'lastName', 'fullName', 'dob', 'gender', 'nationality'],
+      'contact': ['email', 'phone', 'alternateEmail'],
+      'address': ['street', 'city', 'state', 'zip', 'country'],
+      'education': ['university', 'degree', 'major', 'gpa', 'graduationYear'],
+      'professional': ['company', 'jobTitle', 'linkedin', 'github', 'experience'],
+      'other': ['skills', 'languages', 'bio']
+    };
+
+    for (const [id, title] of Object.entries(categories)) {
+      chrome.contextMenus.create({
+        id: `cat-${id}`,
+        parentId: 'map-field',
+        title: title,
+        contexts: ['editable']
+      });
+
+      if (fields[id]) {
+        fields[id].forEach(field => {
+          chrome.contextMenus.create({
+            id: `map-${field}`,
+            parentId: `cat-${id}`,
+            title: formatFieldName(field),
+            contexts: ['editable']
+          });
+        });
+      }
+    }
+  });
+}
+
+function formatFieldName(name) {
+  return name.replace(/([a-z])([A-Z])/g, '$1 $2')
+    .split(' ').map(s => s.charAt(0).toUpperCase() + s.slice(1)).join(' ');
+}
 
 // Listen for messages
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -51,6 +114,14 @@ chrome.commands.onCommand.addListener((command) => {
 chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === 'fill-form') {
     triggerFillingInActiveTab();
+  } else if (info.menuItemId.startsWith('map-')) {
+    const fieldName = info.menuItemId.replace('map-', '');
+    if (tab?.id) {
+      chrome.tabs.sendMessage(tab.id, { 
+        action: 'mapField', 
+        fieldName: fieldName 
+      }).catch(() => {});
+    }
   }
 });
 
@@ -66,7 +137,7 @@ async function handleMessage(request, sender, sendResponse) {
   try {
     switch (request.action) {
       case 'dataUpdated':
-        await broadcastToAllTabs({ action: 'dataUpdated', formData: request.formData, settings: request.settings });
+        await broadcastDataUpdate(request.formData, request.settings);
         sendResponse({ success: true });
         break;
 
@@ -104,6 +175,11 @@ async function handleMessage(request, sender, sendResponse) {
         const letter = await generateCoverLetterWithGemini(request.jobDescription, request.profileData, request.tone, request.apiKey);
         sendResponse({ success: true, result: letter });
         break;
+
+      case 'switchProfile':
+        await chrome.storage.local.set({ currentProfile: request.profile });
+        await broadcastToAllTabs({ action: 'profileUpdated', profile: request.profile });
+        sendResponse({ success: true });
         break;
 
       case 'extractFromUrl':
@@ -128,6 +204,19 @@ async function broadcastToAllTabs(message) {
       chrome.tabs.sendMessage(tab.id, message).catch(() => {});
     }
   }
+}
+
+// Helper to broadcast full data update
+async function broadcastDataUpdate(formData, settings) {
+  const result = await chrome.storage.local.get(['lockedProfiles', 'currentProfile', 'siteSpecificPatterns']);
+  await broadcastToAllTabs({
+    action: 'dataUpdated',
+    formData,
+    settings,
+    lockedProfiles: result.lockedProfiles,
+    currentProfile: result.currentProfile,
+    siteSpecificPatterns: result.siteSpecificPatterns
+  });
 }
 
 // Analyze multiple fields with Gemini
@@ -173,6 +262,30 @@ Return ONLY the JSON object, no other text.`;
     return {};
   } catch (error) {
     console.error('Gemini analysis error:', error);
+    
+    const retryId = `retry_analyze_${Date.now()}`;
+    
+    // Notify content script about the error
+    await broadcastToAllTabs({
+      action: 'showToast',
+      message: 'AI field analysis failed. Check your API key.',
+      type: 'error',
+      retryContext: {
+        id: retryId,
+        type: 'analyzeFields'
+      },
+      options: {
+        duration: 0, // Don't auto-dismiss
+        actions: [
+          {
+            id: retryId,
+            label: 'Retry',
+            primary: true
+          }
+        ]
+      }
+    });
+    
     return {};
   }
 }

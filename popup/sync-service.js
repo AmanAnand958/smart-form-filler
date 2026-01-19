@@ -101,9 +101,11 @@ class SyncService {
   }
   
   async executeSync(item, authToken) {
+    let response;
+    
     switch (item.operation) {
       case 'update_profile':
-        await fetch(`${API_BASE}/api/profile`, {
+        response = await fetch(`${API_BASE}/api/profile`, {
           method: 'PUT',
           headers: {
             'Authorization': `Bearer ${authToken}`,
@@ -114,7 +116,7 @@ class SyncService {
         break;
         
       case 'update_field':
-        await fetch(`${API_BASE}/api/profile/field`, {
+        response = await fetch(`${API_BASE}/api/profile/field`, {
           method: 'PATCH',
           headers: {
             'Authorization': `Bearer ${authToken}`,
@@ -124,30 +126,40 @@ class SyncService {
         });
         break;
     }
+    
+    // Check response status
+    if (response && !response.ok) {
+      if (response.status === 401) {
+        // Authentication expired - but don't force logout during sync
+        console.warn('SyncService: Auth token expired, sync will retry later');
+        throw new Error('AUTH_EXPIRED');
+      } else {
+        throw new Error(`Sync failed with status: ${response.status}`);
+      }
+    }
   }
   
   // Conflict resolution - newer timestamp wins
   resolveConflicts(local, cloud) {
-    const merged = { ...local };
+    const localTime = local.updatedAt ? new Date(local.updatedAt) : new Date(0);
+    const cloudTime = cloud.updatedAt ? new Date(cloud.updatedAt) : new Date(0);
     
-    for (const [category, fields] of Object.entries(cloud)) {
-      if (typeof fields !== 'object') continue;
-      
-      if (!merged[category]) {
-        merged[category] = {};
-      }
-      
-      for (const [fieldName, cloudValue] of Object.entries(fields)) {
-        const localValue = merged[category][fieldName];
-        
-        // Cloud wins if local is empty or cloud has value
-        if (!localValue && cloudValue) {
-          merged[category][fieldName] = cloudValue;
-        }
-        // Keep local if it has value (most recent edit)
-      }
+    // If cloud is strictly newer, take it all (LWW)
+    if (cloudTime > localTime) {
+      return { ...cloud };
     }
     
+    // If local is newer or same, merge gaps from cloud
+    const merged = { ...local };
+    for (const [category, fields] of Object.entries(cloud)) {
+      if (typeof fields !== 'object') continue;
+      if (!merged[category]) merged[category] = {};
+      for (const [fieldName, cloudValue] of Object.entries(fields)) {
+        if (!merged[category][fieldName] && cloudValue) {
+          merged[category][fieldName] = cloudValue;
+        }
+      }
+    }
     return merged;
   }
   

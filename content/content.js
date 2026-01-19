@@ -4,7 +4,22 @@
 (function() {
   'use strict';
   
-  console.log('Smart Form Filler Content Script v2.1 Loaded');
+  // Domains to avoid being distracting (video, entertainment, reels)
+  const DISTRACTION_FREE_DOMAINS = [
+    'youtube.com', 'netflix.com', 'tiktok.com', 'instagram.com', 
+    'twitch.tv', 'hulu.com', 'disneyplus.com', 'hbomax.com', 'primevideo.com'
+  ];
+
+  function isRestrictedDomain() {
+    const hostname = window.location.hostname.toLowerCase();
+    const href = window.location.href.toLowerCase();
+    return DISTRACTION_FREE_DOMAINS.some(d => hostname.includes(d) || href.includes(d));
+  }
+
+  // CRITICAL: Exit immediately if on a blacklisted domain before any other logic runs
+  if (isRestrictedDomain()) return;
+
+  console.log('Smart Form Filler Content Script v2.2 Loaded');
 
   let storedData = null;
   let settings = null;
@@ -14,9 +29,22 @@
   let scanRetryCount = 0;
   let currentProfile = 'personal';
   let lockedProfiles = [];
+  let siteSpecificPatterns = {};
+  let lastRightClickedElement = null;
+  const isInternalFrame = window.self !== window.top;
   const MAX_RETRIES = 3;
   const RETRY_DELAY = 1500;
-  const autoFilledValues = new Map(); // Track auto-filled values for adaptive learning
+  const autoFilledValues = new Map();
+  let formIntersectionObserver = null;
+  let activeToasts = [];
+  let retryContext = {}; // Store retry information for toast actions
+
+  // Smart Profile Switching: URL patterns → Profile mapping
+  const PROFILE_URL_PATTERNS = {
+    work: ['linkedin.com', 'glassdoor.com', 'indeed.com', 'monster.com'],
+    job_apps: ['workday.com', 'greenhouse.io', 'lever.co', 'myworkday.com', 'taleo.net'],
+    personal: [] // Default fallback
+  };
 
   // Extended field patterns for better matching
   const FIELD_PATTERNS = {
@@ -173,10 +201,15 @@
     /token/i, /csrf/i, /nonce/i,
     /hidden/i, /consent/i, /gdpr/i, /terms/i, /agree/i
   ];
+  
+  // Already handled at top of script
 
   // Initialize
   async function init() {
     await loadStoredData();
+    
+    // Smart profile switching
+    await detectAndSwitchProfile();
     
     // Keyboard Shortcut (Alt+Shift+F)
     document.addEventListener('keydown', (e) => {
@@ -208,8 +241,15 @@
       observeFormSubmissions();
     }
     
-    setupSmartSuggestions();
     chrome.runtime.onMessage.addListener(handleMessage);
+
+    // Track right-clicked element for context menu mapping
+    document.addEventListener('contextmenu', (e) => {
+      lastRightClickedElement = e.target;
+    }, true);
+
+    // Initial HUD Injection
+    injectHUD();
   }
 
   // Schedule form scan with retries
@@ -248,12 +288,13 @@
   // Load data from storage
   async function loadStoredData() {
     try {
-      const result = await chrome.storage.local.get(['formData', 'settings', 'lockedProfiles', 'currentProfile']);
+      const result = await chrome.storage.local.get(['formData', 'settings', 'lockedProfiles', 'currentProfile', 'siteSpecificPatterns']);
       storedData = result.formData || {};
       settings = result.settings || { autoFillEnabled: true, showConfirmation: true, learnFromForms: true };
       
       lockedProfiles = result.lockedProfiles || [];
       currentProfile = result.currentProfile || 'personal';
+      siteSpecificPatterns = result.siteSpecificPatterns || {};
     } catch (error) {
       console.error('Form Filler: Error loading data', error);
     }
@@ -266,15 +307,29 @@
       settings = message.settings;
       if (message.lockedProfiles) lockedProfiles = message.lockedProfiles;
       if (message.currentProfile) currentProfile = message.currentProfile;
+      if (message.siteSpecificPatterns) siteSpecificPatterns = message.siteSpecificPatterns;
       console.log('Form Filler: Data updated from background');
+      updateHUDInfo();
       if (!settings.guestMode) {
         detectForms();
       }
+    } else if (message.action === 'profileUpdated') {
+      currentProfile = message.profile;
+      updateHUDInfo();
+      detectForms(); // Re-scan with new profile
     } else if (message.action === 'triggerFilling') {
       console.log('Form Filler: Manual trigger received');
-      detectForms(true); // Force fill even if auto-fill setting is off or in guest mode
+      detectForms(true);
+    } else if (message.action === 'mapField') {
+      handleManualMapping(message.fieldName);
     } else if (message.action === 'getPageText') {
       sendResponse({ text: document.body.innerText.substring(0, 5000) });
+    } else if (message.action === 'showToast') {
+      // Store retry context if provided
+      if (message.retryContext) {
+        retryContext[message.retryContext.id] = message.retryContext;
+      }
+      showToast(message.message, message.type, message.options || {});
     }
   }
 
@@ -291,10 +346,18 @@
 
   // Detect forms on the page - now with Shadow DOM and iframe support
   async function detectForms(force = false) {
-    // Check if domain is disabled
+    // Early exit for restricted domains unless forced (e.g. via keyboard shortcut)
+    if (isRestrictedDomain() && !force) {
+      removeHUD();
+      removeMagicFillIcons();
+      return;
+    }
+
+    // Check if domain is disabled via user settings
     const { disabledDomains = [] } = await chrome.storage.local.get('disabledDomains');
     if (disabledDomains.includes(window.location.hostname) && !force) {
       console.log('Form Filler: Domain is disabled, skipping detection');
+      removeHUD();
       removeMagicFillIcons();
       return;
     }
@@ -327,13 +390,33 @@
       if (detectedFields.length > 0) {
         injectMagicFillIcons();
         
+        const shouldShowHUD = settings?.showHUD !== false;
+        const isBlacklistedDomain = DISTRACTION_FREE_DOMAINS.some(d => window.location.hostname.includes(d) || window.location.href.includes(d));
+
+        if (shouldShowHUD && !isBlacklistedDomain) {
+          injectHUD();
+        } else {
+          removeHUD();
+        }
+        
         if (hasMatchingData()) {
-          if (settings?.showConfirmation) {
-            showConfirmationPopup();
-          } else {
-            fillFields();
+          // Sensitive Field Protection: Force confirmation if SSN or Passport detected
+          const securitySensitive = detectedFields.some(f => 
+            /ssn|passport|national_id|id_number/.test(f.fieldKey)
+          );
+
+          if (!isBlacklistedDomain) {
+            if (settings?.showConfirmation || securitySensitive) {
+              if (securitySensitive) console.log('Form Filler: Sensitive fields detected, forcing confirmation popup for security.');
+              showConfirmationPopup();
+            } else {
+              fillFields();
+            }
           }
         }
+      } else {
+        removeHUD();
+        removeMagicFillIcons();
       }
     }, waitTime);
   }
@@ -482,8 +565,23 @@
   // Identify field type with site-specific handling
   function identifyField(input, siteConfig) {
     const identifier = getFieldIdentifier(input);
+    const hostname = window.location.hostname;
     
-    // Check site-specific handlers first
+    // Check manual mappings (Adaptive Learning) first
+    if (siteSpecificPatterns[hostname]) {
+      const fieldId = input.id?.toLowerCase() || input.name?.toLowerCase() || input.placeholder?.toLowerCase();
+      if (fieldId && siteSpecificPatterns[hostname][fieldId]) {
+        const fieldKey = siteSpecificPatterns[hostname][fieldId];
+        return { 
+          key: fieldKey, 
+          category: CATEGORY_MAP[fieldKey] || 'other', 
+          identifier,
+          isManualMatch: true 
+        };
+      }
+    }
+
+    // Check site-specific handlers
     if (siteConfig?.specialHandlers) {
       for (const [pattern, fieldKey] of Object.entries(siteConfig.specialHandlers)) {
         if (identifier.includes(pattern.toLowerCase())) {
@@ -1146,55 +1244,22 @@ function removeMagicFillIcons() {
       }
     }
     
-    // Trigger all relevant events
-    ['input', 'change', 'blur', 'keydown', 'keyup', 'keypress'].forEach(eventType => {
-      element.dispatchEvent(new Event(eventType, { bubbles: true }));
+    // Trigger all relevant events with delay for framework lifecycle
+    requestAnimationFrame(() => {
+      ['input', 'change', 'blur', 'keydown', 'keyup', 'keypress'].forEach(eventType => {
+        const event = new Event(eventType, { bubbles: true, cancelable: true });
+        // Some frameworks check for these properties
+        Object.defineProperty(event, 'simulated', { value: true, writable: false });
+        element.dispatchEvent(event);
+      });
+      
+      // Focus and blur for validation triggers
+      element.focus();
+      setTimeout(() => element.blur(), 50);
     });
-    
-    // Focus and blur for validation triggers
-    element.focus();
-    setTimeout(() => element.blur(), 50);
   }
 
   // Observe DOM for dynamically added forms
-  function observeDOMChanges() {
-    let debounceTimer;
-    
-    const observer = new MutationObserver((mutations) => {
-      let shouldCheck = false;
-      
-      mutations.forEach(mutation => {
-      mutation.addedNodes.forEach(node => {
-        if (node.nodeType === Node.ELEMENT_NODE) {
-          // Ignore our own extension elements to prevent feedback loops
-          if (node.id === 'smart-form-filler-popup' || node.id === 'sff-ai-draft-prompt' || 
-              node.classList.contains('sff-magic-icon') || node.classList.contains('sff-ai-icon')) {
-            return;
-          }
-
-          if (node.matches?.('form, input, select, textarea, [role="form"]') ||
-              node.querySelector?.('form, input, select, textarea')) {
-            // Further verify it's not our own input being detected
-            if (node.closest?.('#smart-form-filler-popup, #sff-ai-draft-prompt')) return;
-            
-            shouldCheck = true;
-          }
-        }
-      });
-    });
-      
-      if (shouldCheck) {
-        clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(() => {
-          hasScannedPage = false;
-          detectForms();
-        }, 500);
-      }
-    });
-    
-    observer.observe(document.body, { childList: true, subtree: true });
-  }
-
   // Observe form submissions to learn data
   function observeFormSubmissions() {
     // Form submit event
@@ -1359,6 +1424,416 @@ function removeMagicFillIcons() {
     return str.length > len ? str.substring(0, len) + '…' : str;
   }
 
+  // Handle manual field mapping from context menu
+  async function handleManualMapping(fieldKey) {
+    if (!lastRightClickedElement) return;
+    
+    const element = lastRightClickedElement;
+    const category = CATEGORY_MAP[fieldKey] || 'other';
+    
+    // Identify best attribute to save (id, name, then placeholder)
+    const attribute = element.id || element.name || element.placeholder;
+    if (!attribute) {
+      console.log('Form Filler: Could not find a reliable attribute to map');
+      return;
+    }
+
+    // Save to adaptive learning (siteSpecificPatterns)
+    const hostname = window.location.hostname;
+    try {
+      const { siteSpecificPatterns = {} } = await chrome.storage.local.get('siteSpecificPatterns');
+      
+      if (!siteSpecificPatterns[hostname]) {
+        siteSpecificPatterns[hostname] = {};
+      }
+      
+      // Save mapping: "attribute_value": "fieldKey"
+      siteSpecificPatterns[hostname][attribute.toLowerCase()] = fieldKey;
+      
+      await chrome.storage.local.set({ siteSpecificPatterns });
+      console.log(`Form Filler: Manually mapped "${attribute}" to "${fieldKey}" for ${hostname}`);
+      
+      // Immediately fill the field as feedback
+      const value = storedData[category]?.[fieldKey];
+      if (value) {
+        element.value = value;
+        element.dispatchEvent(new Event('input', { bubbles: true }));
+        element.dispatchEvent(new Event('change', { bubbles: true }));
+        
+        // Visual feedback
+        const originalBorder = element.style.border;
+        element.style.border = '2px solid #7C3AED';
+        setTimeout(() => {
+          element.style.border = originalBorder;
+        }, 1000);
+      }
+    } catch (error) {
+      console.error('Form Filler: Error saving manual mapping', error);
+    }
+  }
+
+  // --- HUD Logic ---
+  let hudElement = null;
+  let isHudDragging = false;
+  let hudDragOffset = { x: 0, y: 0 };
+
+  function injectHUD() {
+    if (settings?.showHUD === false) return;
+    if (isRestrictedDomain()) return;
+    
+    // Don't inject HUD in small frames
+    if (isInternalFrame && window.innerWidth < 150) return;
+
+    if (document.getElementById('sff-hud')) {
+      // If already there, ensure it's visible
+      hudElement.style.display = 'flex';
+      return;
+    }
+
+    hudElement = document.createElement('div');
+    hudElement.id = 'sff-hud';
+    hudElement.className = 'sff-hud collapsed'; // Default to collapsed
+    
+    // Default position (bottom right)
+    hudElement.style.bottom = '20px';
+    hudElement.style.right = '20px';
+
+    hudElement.innerHTML = `
+      <div class="sff-hud-header" id="sff-hud-header">
+        <div class="sff-hud-title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path></svg>
+          <span>SMART FILL</span>
+        </div>
+        <div class="sff-hud-controls">
+          <span class="sff-hud-minimize" id="sff-hud-minimize" title="Minimize to Bubble">−</span>
+        </div>
+      </div>
+      <div class="sff-hud-body">
+        <div class="sff-hud-actions">
+          <button class="sff-hud-btn sff-hud-btn-primary" id="sff-hud-fill-all">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
+            Auto Fill Form
+          </button>
+          <button class="sff-hud-btn" id="sff-hud-switch-profile">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><polyline points="16 11 18 13 22 9"></polyline></svg>
+            Switch Profile
+          </button>
+        </div>
+        <div class="sff-hud-profile-info">
+          <span>Active: <span class="sff-hud-current-profile" id="sff-hud-active-profile">${currentProfile}</span></span>
+          <span id="sff-hud-lock-status">${lockedProfiles.includes(currentProfile) ? '🔒' : '🔓'}</span>
+        </div>
+      </div>
+      <div class="sff-hud-footer">
+        <div class="sff-hud-collapse" id="sff-hud-collapse">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"></polyline></svg>
+        </div>
+      </div>
+      <div class="sff-hud-trigger" id="sff-hud-trigger">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path></svg>
+      </div>
+    `;
+
+    document.body.appendChild(hudElement);
+    setupHUDListeners();
+  }
+
+  function setupHUDListeners() {
+    const header = document.getElementById('sff-hud-header');
+    const fillBtn = document.getElementById('sff-hud-fill-all');
+    const switchBtn = document.getElementById('sff-hud-switch-profile');
+    const collapseBtn = document.getElementById('sff-hud-collapse');
+    const minimizeBtn = document.getElementById('sff-hud-minimize');
+    const trigger = document.getElementById('sff-hud-trigger');
+
+    // Dragging
+    header.addEventListener('mousedown', startHudDrag);
+    document.addEventListener('mousemove', handleHudDrag);
+    document.addEventListener('mouseup', endHudDrag);
+
+    // Actions
+    fillBtn.addEventListener('click', () => detectForms(true));
+    
+    switchBtn.addEventListener('click', async () => {
+      const result = await chrome.storage.local.get(['profiles']);
+      const profileNames = Object.keys(result.profiles || {});
+      if (profileNames.length > 1) {
+        let nextIndex = (profileNames.indexOf(currentProfile) + 1) % profileNames.length;
+        const nextProfile = profileNames[nextIndex];
+        chrome.runtime.sendMessage({ action: 'switchProfile', profile: nextProfile });
+      }
+    });
+
+    collapseBtn.addEventListener('click', () => {
+      hudElement.classList.add('collapsed');
+    });
+
+    minimizeBtn.addEventListener('click', () => {
+      hudElement.classList.add('collapsed');
+    });
+
+    trigger.addEventListener('click', () => {
+      hudElement.classList.remove('collapsed');
+    });
+  }
+
+  function startHudDrag(e) {
+    isHudDragging = true;
+    hudElement.classList.add('dragging');
+    const rect = hudElement.getBoundingClientRect();
+    hudDragOffset.x = e.clientX - rect.left;
+    hudDragOffset.y = e.clientY - rect.top;
+    
+    // Remove bottom/right positioning to allow absolute movement
+    hudElement.style.bottom = 'auto';
+    hudElement.style.right = 'auto';
+    hudElement.style.top = rect.top + 'px';
+    hudElement.style.left = rect.left + 'px';
+    
+    e.preventDefault();
+  }
+
+  function handleHudDrag(e) {
+    if (!isHudDragging) return;
+    
+    const x = e.clientX - hudDragOffset.x;
+    const y = e.clientY - hudDragOffset.y;
+    
+    // Bounds check
+    const maxX = window.innerWidth - hudElement.offsetWidth;
+    const maxY = window.innerHeight - hudElement.offsetHeight;
+    
+    hudElement.style.left = Math.max(0, Math.min(x, maxX)) + 'px';
+    hudElement.style.top = Math.max(0, Math.min(y, maxY)) + 'px';
+  }
+
+  function endHudDrag() {
+    if (!isHudDragging) return;
+    isHudDragging = false;
+    hudElement.classList.remove('dragging');
+  }
+
+  function updateHUDInfo() {
+    if (settings?.showHUD === false) {
+      removeHUD();
+      return;
+    }
+    const profileEl = document.getElementById('sff-hud-active-profile');
+    const lockEl = document.getElementById('sff-hud-lock-status');
+    if (profileEl) profileEl.textContent = currentProfile;
+    if (lockEl) lockEl.textContent = lockedProfiles.includes(currentProfile) ? '🔒' : '🔓';
+  }
+
+  function removeHUD() {
+    const existing = document.getElementById('sff-hud');
+    if (existing) {
+      existing.remove();
+      hudElement = null;
+    }
+  }
+
+  function isRestrictedDomain() {
+    // Redundant but safe
+    const hostname = window.location.hostname.toLowerCase();
+    const href = window.location.href.toLowerCase();
+    return DISTRACTION_FREE_DOMAINS.some(d => hostname.includes(d) || href.includes(d));
+  }
+
   // Start
   init();
+  // Toast Notification System
+  function showToast(message, type = 'info', options = {}) {
+    const { actions = [], duration = 5000 } = options;
+    
+    const toast = document.createElement('div');
+    toast.className = `sff-toast ${type}`;
+    
+    const icons = {
+      error: '❌',
+      success: '✓',
+      warning: '⚠️',
+      info: 'ℹ️'
+    };
+    
+    let actionsHTML = '';
+    if (actions.length > 0) {
+      actionsHTML = `<div class="sff-toast-actions">${actions.map(action => 
+        `<button class="sff-toast-btn ${action.primary ? 'sff-toast-btn-primary' : 'sff-toast-btn-secondary'}" data-action="${action.id}">${action.label}</button>`
+      ).join('')}</div>`;
+    }
+    
+    // Create structure safely without exposing message to XSS
+    toast.innerHTML = `
+      <div class="sff-toast-icon">${icons[type]}</div>
+      <div class="sff-toast-content">
+        <div class="sff-toast-message"></div>
+        ${actionsHTML}
+      </div>
+      <div class="sff-toast-close">×</div>
+    `;
+    
+    // Safely set message content (XSS-proof)
+    const messageDiv = toast.querySelector('.sff-toast-message');
+    messageDiv.textContent = message;
+    
+    // Accessibility attributes
+    toast.setAttribute('role', type === 'error' ? 'alert' : 'status');
+    toast.setAttribute('aria-live', type === 'error' ? 'assertive' : 'polite');
+    
+    document.body.appendChild(toast);
+    activeToasts.push(toast);
+    
+    // Keyboard support - Escape to dismiss
+    const escapeHandler = (e) => {
+      if (e.key === 'Escape' && activeToasts.includes(toast)) {
+        removeToast(toast);
+        document.removeEventListener('keydown', escapeHandler);
+      }
+    };
+    document.addEventListener('keydown', escapeHandler);
+    
+    // Close handler
+    toast.querySelector('.sff-toast-close').addEventListener('click', () => {
+      removeToast(toast);
+    });
+    
+    // Action handlers
+    actions.forEach(action => {
+      const btn = toast.querySelector(`[data-action="${action.id}"]`);
+      if (btn) {
+        btn.addEventListener('click', () => {
+          // Handle retry actions
+          if (action.id.startsWith('retry_')) {
+            const context = retryContext[action.id];
+            if (context) {
+              handleRetry(context);
+              delete retryContext[action.id]; // Clean up
+            }
+          } else if (action.callback) {
+            action.callback();
+          }
+          removeToast(toast);
+        });
+      }
+    });
+    
+    // Auto-remove after duration
+    if (duration > 0) {
+      setTimeout(() => removeToast(toast), duration);
+    }
+    
+    return toast;
+  }
+
+  function removeToast(toast) {
+    if (toast && toast.parentElement) {
+      toast.style.animation = 'sff-toast-slide-in 0.3s reverse';
+      setTimeout(() => {
+        toast.remove();
+        activeToasts = activeToasts.filter(t => t !== toast);
+      }, 300);
+    }
+  }
+
+  // Handle retry actions for failed operations
+  function handleRetry(context) {
+    if (context.type === 'analyzeFields') {
+      // Re-trigger form detection which will call the AI again
+      detectForms(true);
+      showToast('Retrying field analysis...', 'info', { duration: 2000 });
+    } else if (context.type === 'generateField') {
+      // Show a toast that this needs to be retried from the popup
+      showToast('Please retry generation from the popup', 'warning', { duration: 4000 });
+    }
+  }
+
+  // Smart Profile Switching based on URL
+  async function detectAndSwitchProfile() {
+    const url = window.location.hostname.toLowerCase();
+    
+    for (const [profile, patterns] of Object.entries(PROFILE_URL_PATTERNS)) {
+      if (patterns.some(pattern => url.includes(pattern))) {
+        const { currentProfile: storedProfile } = await chrome.storage.local.get(['currentProfile']);
+        
+        if (storedProfile !== profile) {
+          console.log(`Smart Form Filler: Auto-switching to "${profile}" profile for ${url}`);
+          await chrome.runtime.sendMessage({ action: 'switchProfile', profile });
+          currentProfile = profile;
+          showToast(`Switched to "${profile.replace('_', ' ')}" profile`, 'info', { duration: 3000 });
+        }
+        return;
+      }
+    }
+  }
+
+  // Smarter MutationObserver with IntersectionObserver
+  function observeDOMChanges() {
+    let debounceTimer;
+    const detectedForms = new Set();
+    
+    // Periodic cleanup of detectedForms to prevent memory leaks
+    setInterval(() => {
+      // Remove forms that are no longer in the DOM
+      detectedForms.forEach(form => {
+        if (!document.contains(form)) {
+          detectedForms.delete(form);
+        }
+      });
+    }, 30000); // Clean up every 30 seconds
+    
+    // IntersectionObserver to track visible forms
+    formIntersectionObserver = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting && !detectedForms.has(entry.target)) {
+          detectedForms.add(entry.target);
+          clearTimeout(debounceTimer);
+          debounceTimer = setTimeout(() => {
+            hasScannedPage = false;
+            detectForms();
+          }, 500);
+        } else if (!entry.isIntersecting) {
+          // Remove from Set when no longer visible
+          detectedForms.delete(entry.target);
+        }
+      });
+    }, {
+      root: null,
+      rootMargin: '50px',
+      threshold: 0.1
+    });
+    
+    const mutationObserver = new MutationObserver((mutations) => {
+      mutations.forEach(mutation => {
+        mutation.addedNodes.forEach(node => {
+          if (node.nodeType === Node.ELEMENT_NODE) {
+            // Ignore our own extension elements
+            if (node.id === 'smart-form-filler-popup' || node.id === 'sff-hud' ||
+                node.classList?.contains('sff-magic-icon') || node.classList?.contains('sff-toast')) {
+              return;
+            }
+
+            // Check if it's a form or contains form elements
+            if (node.matches?.('form, [role="form"]')) {
+              formIntersectionObserver.observe(node);
+            } else if (node.querySelector) {
+              node.querySelectorAll('form, [role="form"]').forEach(form => {
+                formIntersectionObserver.observe(form);
+              });
+            }
+          }
+        });
+      });
+    });
+    
+    mutationObserver.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+    
+    // Also observe existing forms on page load
+    document.querySelectorAll('form, [role="form"]').forEach(form => {
+      formIntersectionObserver.observe(form);
+    });
+  }
+
 })();

@@ -70,10 +70,40 @@ let currentOnboardingSlide = 1;
 let currentTab = 'learned';
 let currentDomain = '';
 
-// Initialize popup
+// Initialize popup with error boundary
 document.addEventListener('DOMContentLoaded', async () => {
-  await checkAuth();
+  try {
+    await checkAuth();
+  } catch (error) {
+    console.error('Popup initialization failed:', error);
+    showFatalError(error);
+  }
 });
+
+// Show fatal error screen with recovery options
+function showFatalError(error) {
+  document.body.innerHTML = `
+    <div style="padding: 40px; text-align: center; font-family: system-ui; color: #1f2937;">
+      <div style="font-size: 48px; margin-bottom: 20px;">⚠️</div>
+      <h2 style="margin: 0 0 10px 0; color: #dc2626;">Extension Error</h2>
+      <p style="color: #6b7280; margin-bottom: 20px;">
+        Smart Form Filler encountered an initialization error.
+      </p>
+      <details style="margin: 20px 0; text-align: left; background: #f3f4f6; padding: 15px; border-radius: 8px;">
+        <summary style="cursor: pointer; font-weight: 600; color: #374151;">Technical Details</summary>
+        <pre style="margin-top: 10px; font-size: 12px; color: #6b7280; overflow: auto;">${error.message}\n${error.stack}</pre>
+      </details>
+      <div style="display: flex; gap: 10px; justify-content: center; margin-top: 30px;">
+        <button onclick="chrome.runtime.reload()" style="padding: 10px 20px; background: linear-gradient(135deg, #7C3AED, #EC4899); color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: 600;">
+          Reload Extension
+        </button>
+        <button onclick="window.close()" style="padding: 10px 20px; background: #e5e7eb; color: #374151; border: none; border-radius: 8px; cursor: pointer; font-weight: 600;">
+          Close
+        </button>
+      </div>
+    </div>
+  `;
+}
 
 // Check authentication status
 async function checkAuth() {
@@ -141,13 +171,14 @@ async function showMainApp() {
   await loadStoredData();
   await loadProfiles();
   await loadHistory();
+  
   if (authToken && !settings?.guestMode) {
     await syncFromCloud();
+    // After cloud sync, we should reload the local state to reflect changes
+    await loadProfiles();
+    await loadStoredData();
   }
   
-  // Sync after loading local data
-  await loadProfiles();
-  await loadStoredData();
   await initializeSiteControl();
   renderProfileOptions();
   renderTemplates();
@@ -195,11 +226,13 @@ async function loadProfiles() {
 
 // Save current profile
 async function saveCurrentProfile() {
+  const now = new Date().toISOString();
+  formData.updatedAt = now;
   profiles[currentProfile] = formData;
   await chrome.storage.local.set({ profiles, currentProfile });
   
   if (syncService) {
-    syncService.queueSync('update_profile', { formData, profiles });
+    syncService.queueSync('update_profile', { formData, profiles, updatedAt: now });
   } else {
     syncToCloud();
   }
@@ -539,6 +572,8 @@ async function saveStoredData() {
   }
 }
 
+
+
 // Merge form data
 function mergeFormData(local, cloud) {
   const merged = { ...local };
@@ -575,6 +610,7 @@ async function loadStoredData() {
     const learnCheckbox = document.getElementById('learnFromForms');
     const apiKeyInput = document.getElementById('geminiApiKey');
     const magicIconCheckbox = document.getElementById('showMagicIcon');
+    const hudCheckbox = document.getElementById('showHUD');
     const magicIconSelect = document.getElementById('magicIconBehavior');
     
     if (autoFillCheckbox) autoFillCheckbox.checked = settings.autoFillEnabled && !settings.guestMode;
@@ -582,7 +618,8 @@ async function loadStoredData() {
     if (confirmCheckbox) confirmCheckbox.checked = settings.showConfirmation;
     if (learnCheckbox) learnCheckbox.checked = settings.learnFromForms && !settings.guestMode;
     if (apiKeyInput) apiKeyInput.value = settings.geminiApiKey || '';
-    if (magicIconCheckbox) magicIconCheckbox.checked = settings.showMagicIcon !== false; // Default true
+    if (magicIconCheckbox) magicIconCheckbox.checked = settings.showMagicIcon !== false;
+    if (hudCheckbox) hudCheckbox.checked = settings.showHUD !== false;
     if (magicIconSelect) magicIconSelect.value = settings.magicIconBehavior || 'always';
     
     updateGuestModeUI();
@@ -1033,16 +1070,17 @@ function setupEventListeners() {
   document.getElementById('guestModeEnabled').addEventListener('change', saveSettings);
   document.getElementById('showConfirmation').addEventListener('change', saveSettings);
   document.getElementById('learnFromForms').addEventListener('change', saveSettings);
-  document.getElementById('showMagicIcon')?.addEventListener('change', saveSettings);
-  document.getElementById('magicIconBehavior')?.addEventListener('change', saveSettings);
+  document.getElementById('showMagicIcon').addEventListener('change', saveSettings);
+  document.getElementById('showHUD').addEventListener('change', saveSettings);
+  document.getElementById('magicIconBehavior').addEventListener('change', saveSettings);
   document.getElementById('geminiApiKey').addEventListener('blur', saveSettings);
   document.getElementById('testApiKey')?.addEventListener('click', testGeminiApiKey);
   
   // Export/Import/Clear
-  document.getElementById('exportData').addEventListener('click', exportData);
-  document.getElementById('importData').addEventListener('click', () => document.getElementById('importFile').click());
-  document.getElementById('importFile').addEventListener('change', importData);
-  document.getElementById('clearData').addEventListener('click', clearAllData);
+  document.getElementById('exportDataBtn').addEventListener('click', exportData);
+  document.getElementById('importDataBtn').addEventListener('click', () => document.getElementById('importFileInput').click());
+  document.getElementById('importFileInput').addEventListener('change', importData);
+  
   
   // Theme Toggle
   document.getElementById('themeDark')?.addEventListener('click', () => setTheme('dark'));
@@ -1069,12 +1107,34 @@ function setupEventListeners() {
   document.getElementById('bulkMove')?.addEventListener('click', handleBulkMove);
   
   // Sync and Logout
-  document.getElementById('syncBtn').addEventListener('click', () => {
-    if (syncService) {
-      syncService.processQueue();
+  document.getElementById('syncBtn').addEventListener('click', async () => {
+    // Check if user is authenticated
+    const { guestMode } = await chrome.storage.local.get(['guestMode']);
+    
+    if (guestMode) {
+      showStatus('Sync not available in Guest Mode', 'info');
+      return;
     }
-    syncToCloud();
-    showStatus('Synced!', 'success');
+    
+    if (!authToken) {
+      showStatus('Please log in to sync', 'error');
+      return;
+    }
+    
+    try {
+      if (syncService) {
+        await syncService.processQueue();
+      }
+      await syncToCloud();
+      showStatus('Synced successfully!', 'success');
+    } catch (error) {
+      console.error('Sync error:', error);
+      if (error.message === 'AUTH_EXPIRED') {
+        showStatus('Session expired. Please log in again.', 'error');
+      } else {
+        showStatus('Sync failed. Will retry later.', 'error');
+      }
+    }
   });
   document.getElementById('logoutBtn').addEventListener('click', logout);
   
@@ -1151,8 +1211,19 @@ async function addNewField() {
     showStatus('Please fill in both field name and value', 'error');
     return;
   }
+
+  // Validation
+  const validation = validateField(fieldName, value);
+  if (!validation.valid) {
+    showStatus(validation.message, 'error');
+    return;
+  }
   
   if (!formData[category]) formData[category] = {};
+  
+  // Track field history before updating
+  await trackFieldHistory(category, fieldName, formData[category][fieldName]);
+  
   formData[category][fieldName] = value;
   
   await saveCurrentProfile();
@@ -1181,6 +1252,7 @@ function editField(category, fieldName) {
         <label>Value</label>
         <input type="text" id="editValue" value="${escapeHtml(currentValue)}">
       </div>
+      <button class="btn btn-secondary" id="viewHistoryBtn" style="margin-top: 10px;">📜 View History</button>
       <div class="modal-actions">
         <button class="btn btn-secondary" id="cancelEdit">Cancel</button>
         <button class="btn btn-primary" id="saveEdit">Save</button>
@@ -1195,22 +1267,57 @@ function editField(category, fieldName) {
   input.select();
   
   document.getElementById('cancelEdit').addEventListener('click', () => modal.remove());
-  document.getElementById('saveEdit').addEventListener('click', async () => {
-    const newValue = input.value.trim();
-    if (newValue) {
-      formData[category][fieldName] = newValue;
-      await saveCurrentProfile();
-      await chrome.storage.local.set({ formData });
-      notifyContentScripts();
-      renderLearnedFields(document.getElementById('searchFields').value);
-      showStatus('Field updated!', 'success');
-    }
-    modal.remove();
+  
+  document.getElementById('viewHistoryBtn').addEventListener('click', async () => {
+    await showFieldHistory(category, fieldName);
   });
+  
+  document.getElementById('saveEdit').onclick = async () => {
+    const newValue = document.getElementById('editValue').value.trim();
+    
+    // Validation
+    const validation = validateField(fieldName, newValue);
+    if (!validation.valid) {
+      showStatus(validation.message, 'error');
+      return;
+    }
+
+    if (!formData[category]) formData[category] = {};
+    
+    // Track field history before updating
+    await trackFieldHistory(category, fieldName, formData[category][fieldName]);
+    
+    formData[category][fieldName] = newValue;
+    await saveCurrentProfile();
+    await chrome.storage.local.set({ formData });
+    notifyContentScripts();
+    renderLearnedFields();
+    document.body.removeChild(modal);
+    showStatus('Field updated', 'success');
+  };
   
   modal.addEventListener('click', (e) => {
     if (e.target === modal) modal.remove();
   });
+}
+
+function validateField(name, value) {
+  const n = name.toLowerCase();
+  
+  if (n.includes('email') && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
+    return { valid: false, message: 'Invalid email format' };
+  }
+  
+  if (n.includes('phone') && value.length > 0 && !/^[\d\s\+\-\(\)]{7,}$/.test(value)) {
+    return { valid: false, message: 'Invalid phone format (min 7 digits/symbols)' };
+  }
+
+  if ((n.includes('website') || n.includes('url') || n.includes('linkedin') || n.includes('github')) && 
+      value.length > 0 && !value.includes('.') && !value.startsWith('http')) {
+    return { valid: false, message: 'Invalid URL/Link format' };
+  }
+
+  return { valid: true };
 }
 
 // Delete field
@@ -1241,6 +1348,7 @@ async function saveSettings() {
     showConfirmation: document.getElementById('showConfirmation').checked,
     learnFromForms: document.getElementById('learnFromForms').checked,
     showMagicIcon: document.getElementById('showMagicIcon').checked,
+    showHUD: document.getElementById('showHUD').checked,
     magicIconBehavior: document.getElementById('magicIconBehavior').value,
     geminiApiKey: document.getElementById('geminiApiKey').value.trim(),
     theme: settings.theme || 'dark'
@@ -1310,6 +1418,102 @@ function exportData() {
   
   URL.revokeObjectURL(url);
   showStatus('Data exported!', 'success');
+}
+
+// Field History Management
+async function trackFieldHistory(category, fieldName, oldValue) {
+  if (!oldValue) return; // Don't track initial empty values
+  
+  const { fieldHistory = {} } = await chrome.storage.local.get(['fieldHistory']);
+  const key = `${category}.${fieldName}`;
+  
+  if (!fieldHistory[key]) {
+    fieldHistory[key] = [];
+  }
+  
+  // Add the old value with timestamp
+  fieldHistory[key].unshift({
+    value: oldValue,
+    timestamp: new Date().toISOString(),
+    profile: currentProfile
+  });
+  
+  // Keep only last 5 versions
+  if (fieldHistory[key].length > 5) {
+    fieldHistory[key] = fieldHistory[key].slice(0, 5);
+  }
+  
+  await chrome.storage.local.set({ fieldHistory });
+}
+
+async function showFieldHistory(category, fieldName) {
+  const { fieldHistory = {} } = await chrome.storage.local.get(['fieldHistory']);
+  const key = `${category}.${fieldName}`;
+  const history = fieldHistory[key] || [];
+  
+  const modal = document.createElement('div');
+  modal.className = 'modal-overlay';
+  
+  let historyHTML = '';
+  if (history.length === 0) {
+    historyHTML = '<p style="color: #64748b; text-align: center; padding: 20px;">No history available</p>';
+  } else {
+    historyHTML = history.map((entry, index) => `
+      <div class="history-item" style="padding: 12px; margin: 8px 0; background: rgba(255,255,255,0.05); border-radius: 8px; border: 1px solid rgba(255,255,255,0.1);">
+        <div style="display: flex; justify-content: space-between; align-items: start; gap: 12px;">
+          <div style="flex: 1; min-width: 0;">
+            <div style="font-weight: 600; color: #e2e8f0; word-break: break-word;">${escapeHtml(entry.value)}</div>
+            <div style="font-size: 11px; color: #64748b; margin-top: 4px;">
+              ${new Date(entry.timestamp).toLocaleString()} • ${entry.profile}
+            </div>
+          </div>
+          <button class="btn btn-sm btn-secondary" data-value="${escapeHtml(entry.value)}" style="padding: 4px 8px; font-size: 11px; flex-shrink: 0;">Restore</button>
+        </div>
+      </div>
+    `).join('');
+  }
+  
+  modal.innerHTML = `
+    <div class="modal" style="max-width: 500px;">
+      <h3>📜 History: ${formatFieldName(fieldName)}</h3>
+      <div style="max-height: 400px; overflow-y: auto; margin: 16px 0;">
+        ${historyHTML}
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" id="closeHistoryModal">Close</button>
+      </div>
+    </div>
+  `;
+  
+  document.body.appendChild(modal);
+  
+  document.getElementById('closeHistoryModal').addEventListener('click', () => modal.remove());
+  
+  // Restore handlers
+  modal.querySelectorAll('[data-value]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const valueToRestore = btn.dataset.value;
+      
+      // Update formData
+      if (!formData[category]) formData[category] = {};
+      formData[category][fieldName] = valueToRestore;
+      
+      await saveCurrentProfile();
+      await chrome.storage.local.set({ formData });
+      notifyContentScripts();
+      renderLearnedFields();
+      
+      modal.remove();
+      // Close the edit modal if it's still open
+      document.querySelectorAll('.modal-overlay').forEach(m => m.remove());
+      
+      showStatus(`Restored previous value for ${formatFieldName(fieldName)}`, 'success');
+    });
+  });
+  
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) modal.remove();
+  });
 }
 
 // Update Guest Mode UI
