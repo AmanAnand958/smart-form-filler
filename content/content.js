@@ -313,6 +313,8 @@
       if (!settings.guestMode) {
         detectForms();
       }
+      // Re-apply values to any existing icons/autocompletes
+      refreshMagicIcons();
     } else if (message.action === 'profileUpdated') {
       currentProfile = message.profile;
       updateHUDInfo();
@@ -406,6 +408,9 @@
           );
 
           if (!isBlacklistedDomain) {
+            // Analyze form context for smarter filling
+            analyzeFormIntelligently();
+            
             if (settings?.showConfirmation || securitySensitive) {
               if (securitySensitive) console.log('Form Filler: Sensitive fields detected, forcing confirmation popup for security.');
               showConfirmationPopup();
@@ -413,6 +418,11 @@
               fillFields();
             }
           }
+        }
+        
+        // Setup auto-complete for text fields
+        if (settings?.aiAutoComplete !== false) {
+          setupAutoComplete();
         }
       } else {
         removeHUD();
@@ -463,6 +473,9 @@
       // Check if already filled
       if (input.value && input.value.trim()) return;
       
+      // Prevent duplicates by element reference
+      if (detectedFields.some(f => f.element === input)) return;
+      
       // Identify field
       const match = identifyField(input, siteConfig);
       if (match) {
@@ -490,11 +503,24 @@
       return true;
     }
     // Skip if not visible
-    if (input.offsetParent === null && !input.closest('[aria-hidden="false"]')) {
-      const style = window.getComputedStyle(input);
-      if (style.display === 'none' || style.visibility === 'hidden') {
-        return true;
-      }
+    const style = window.getComputedStyle(input);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+      return true;
+    }
+
+    // Check physical dimensions
+    const rect = input.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) {
+      return true;
+    }
+    
+    // Check if element or any parent is hidden
+    if (input.offsetParent === null && style.position !== 'fixed') {
+      return true;
+    }
+
+    if (input.closest('[aria-hidden="true"]')) {
+      return true;
     }
     return false;
   }
@@ -719,6 +745,51 @@
       if (typeof fields !== 'object') continue;
       if (fields[fieldKey]) return fields[fieldKey];
     }
+
+    // --- Smart Splitting Logic (Fast local fallback) ---
+
+    // 1. Name Splitting
+    if (fieldKey === 'firstName' || fieldKey === 'lastName') {
+      const fullName = storedData.personal?.fullName || storedData.other?.fullName;
+      if (fullName && typeof fullName === 'string') {
+        const parts = fullName.trim().split(/\s+/);
+        if (parts.length >= 2) {
+          if (fieldKey === 'firstName') return parts[0];
+          if (fieldKey === 'lastName') return parts.slice(1).join(' ');
+        }
+      }
+    }
+
+    // 2. Address Splitting (City, State, Zip from full street address)
+    if (['city', 'state', 'zip', 'country'].includes(fieldKey)) {
+      const fullAddress = storedData.address?.street || storedData.other?.address || '';
+      if (fullAddress && fullAddress.includes(',')) {
+        const parts = fullAddress.split(',').map(p => p.trim());
+        // Simple heuristic: "Street, City, State Zip, Country"
+        if (parts.length >= 3) {
+          if (fieldKey === 'city' && parts.length >= 2) return parts[parts.length - 3] || parts[1];
+          if (fieldKey === 'state' && parts.length >= 2) return parts[parts.length - 2].split(' ')[0];
+          if (fieldKey === 'zip' && parts.length >= 2) {
+            const zipPart = parts[parts.length - 2].split(' ');
+            return zipPart.length > 1 ? zipPart[1] : null;
+          }
+        }
+      }
+    }
+
+    // 3. Date Splitting (Day, Month, Year from DOB)
+    if (['day', 'month', 'year', 'birthDay', 'birthMonth', 'birthYear'].includes(fieldKey)) {
+      const dob = storedData.personal?.dob || '';
+      if (dob && (dob.includes('/') || dob.includes('-') || dob.includes(' '))) {
+        const dateParts = dob.split(/[\/\-\s]+/).filter(Boolean);
+        if (dateParts.length === 3) {
+          // Heuristic: DD/MM/YYYY or YYYY-MM-DD
+          if (fieldKey.toLowerCase().includes('year')) return dateParts.find(p => p.length === 4);
+          if (fieldKey.toLowerCase().includes('day')) return dateParts.find(p => p.length <= 2 && parseInt(p) <= 31);
+          if (fieldKey.toLowerCase().includes('month')) return dateParts.find(p => p.length <= 2 && parseInt(p) <= 12);
+        }
+      }
+    }
     
     // Fuzzy match
     const normalizedKey = normalizeFieldName(fieldKey);
@@ -727,6 +798,8 @@
       for (const [key, value] of Object.entries(fields)) {
         const normalizedStoredKey = normalizeFieldName(key);
         if (normalizedStoredKey.includes(normalizedKey) || normalizedKey.includes(normalizedStoredKey)) {
+          // Extra safety: Don't return fullName for firstName/lastName fuzzy matches
+          if ((fieldKey === 'firstName' || fieldKey === 'lastName') && key === 'fullName') continue;
           return value;
         }
       }
@@ -1096,9 +1169,8 @@ function injectMagicFillIcons() {
       };
     } else {
       icon.innerHTML = `
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <rect x="3" y="3" width="18" height="18" rx="3" stroke="currentColor" stroke-width="2"/>
-          <path d="M7 9h10M7 12h7M7 15h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5M12 22V12" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
       `;
       icon.onclick = (e) => {
@@ -1128,12 +1200,34 @@ function injectMagicFillIcons() {
       }
     }
     
+
     // Position icon
     const rect = field.element.getBoundingClientRect();
     const containerRect = container.getBoundingClientRect();
     icon.style.top = `${rect.top - containerRect.top + (rect.height - 18) / 2}px`;
     icon.style.left = `${rect.right - containerRect.left - 24}px`;
-    
+
+    // Tooltip logic
+    if (!isAiTarget && value) {
+      icon.addEventListener('mouseenter', () => {
+        const tooltip = document.createElement('div');
+        tooltip.className = 'sff-tooltip';
+        tooltip.innerText = `Fill: ${value}`;
+        tooltip.id = 'sff-active-tooltip';
+        document.body.appendChild(tooltip);
+        
+        const iconRect = icon.getBoundingClientRect();
+        tooltip.style.position = 'fixed';
+        tooltip.style.top = `${iconRect.top - 35}px`;
+        tooltip.style.left = `${iconRect.left}px`;
+        tooltip.style.zIndex = '2147483647';
+      });
+      
+      icon.addEventListener('mouseleave', () => {
+        document.getElementById('sff-active-tooltip')?.remove();
+      });
+    }
+
     container.appendChild(icon);
   });
 }
@@ -1475,6 +1569,7 @@ function removeMagicFillIcons() {
   // --- HUD Logic ---
   let hudElement = null;
   let isHudDragging = false;
+  let isHudDraggingHappened = false;
   let hudDragOffset = { x: 0, y: 0 };
 
   function injectHUD() {
@@ -1514,6 +1609,10 @@ function removeMagicFillIcons() {
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
             Auto Fill Form
           </button>
+          <button class="sff-hud-btn" id="sff-hud-ai-scan" title="Identify complex or non-English fields using AI">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"></path><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
+            Analyze with AI
+          </button>
           <button class="sff-hud-btn" id="sff-hud-switch-profile">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><polyline points="16 11 18 13 22 9"></polyline></svg>
             Switch Profile
@@ -1541,6 +1640,7 @@ function removeMagicFillIcons() {
   function setupHUDListeners() {
     const header = document.getElementById('sff-hud-header');
     const fillBtn = document.getElementById('sff-hud-fill-all');
+    const aiScanBtn = document.getElementById('sff-hud-ai-scan');
     const switchBtn = document.getElementById('sff-hud-switch-profile');
     const collapseBtn = document.getElementById('sff-hud-collapse');
     const minimizeBtn = document.getElementById('sff-hud-minimize');
@@ -1548,11 +1648,27 @@ function removeMagicFillIcons() {
 
     // Dragging
     header.addEventListener('mousedown', startHudDrag);
+    trigger.addEventListener('mousedown', startHudDrag); // Enable dragging on the bubble!
     document.addEventListener('mousemove', handleHudDrag);
     document.addEventListener('mouseup', endHudDrag);
 
     // Actions
     fillBtn.addEventListener('click', () => detectForms(true));
+    
+    aiScanBtn.addEventListener('click', async () => {
+      aiScanBtn.disabled = true;
+      const originalText = aiScanBtn.innerText;
+      aiScanBtn.innerText = 'Analyzing...';
+      try {
+        await aiScanPage();
+        showToast('AI analysis complete! Found new matches.', 'success');
+      } catch (err) {
+        showToast('AI analysis failed.', 'error');
+      } finally {
+        aiScanBtn.disabled = false;
+        aiScanBtn.innerText = originalText;
+      }
+    });
     
     switchBtn.addEventListener('click', async () => {
       const result = await chrome.storage.local.get(['profiles']);
@@ -1572,13 +1688,18 @@ function removeMagicFillIcons() {
       hudElement.classList.add('collapsed');
     });
 
-    trigger.addEventListener('click', () => {
+    trigger.addEventListener('click', (e) => {
+      if (isHudDraggingHappened) {
+        isHudDraggingHappened = false;
+        return;
+      }
       hudElement.classList.remove('collapsed');
     });
   }
 
   function startHudDrag(e) {
     isHudDragging = true;
+    isHudDraggingHappened = false;
     hudElement.classList.add('dragging');
     const rect = hudElement.getBoundingClientRect();
     hudDragOffset.x = e.clientX - rect.left;
@@ -1595,6 +1716,9 @@ function removeMagicFillIcons() {
 
   function handleHudDrag(e) {
     if (!isHudDragging) return;
+    
+    isHudDraggingHappened = true;
+    hudElement.classList.add('dragging');
     
     const x = e.clientX - hudDragOffset.x;
     const y = e.clientY - hudDragOffset.y;
@@ -1834,6 +1958,242 @@ function removeMagicFillIcons() {
     document.querySelectorAll('form, [role="form"]').forEach(form => {
       formIntersectionObserver.observe(form);
     });
+  }
+
+  // Intelligent Form Analysis
+  async function analyzeFormIntelligently() {
+    const geminiApiKey = settings?.geminiApiKey;
+    if (!geminiApiKey) return;
+    
+    try {
+      const formData = {
+        pageTitle: document.title,
+        pageUrl: window.location.href,
+        fields: detectedFields.map(f => f.fieldKey),
+        labels: detectedFields.reduce((acc, f) => {
+          acc[f.fieldKey] = f.element.getAttribute('aria-label') || f.element.getAttribute('placeholder') || '';
+          return acc;
+        }, {})
+      };
+      
+      const response = await chrome.runtime.sendMessage({
+        action: 'analyzeFormContext',
+        formData,
+        apiKey: geminiApiKey
+      });
+      
+      if (response.success && response.result) {
+        const analysis = response.result;
+        console.log('Form Analysis:', analysis);
+        
+        // Auto-switch profile if different from current
+        if (analysis.recommendedProfile && currentProfile !== analysis.recommendedProfile && analysis.confidence > 70) {
+          showToast(`AI suggests switching to "${analysis.recommendedProfile}" profile for this form`, 'info', {
+            duration: 8000,
+            actions: [
+              {
+                id: 'switch_profile',
+                label: 'Switch',
+                primary: true,
+                callback: async () => {
+                  await chrome.runtime.sendMessage({
+                    action: 'switchProfile',
+                    profile: analysis.recommendedProfile
+                  });
+                  showToast('Profile switched successfully!', 'success', { duration: 3000 });
+                }
+              }
+            ]
+          });
+        }
+      }
+    } catch (error) {
+      console.error('Form analysis error:', error);
+    }
+  }
+
+  // Auto-Complete Setup
+  let autoCompleteDropdown = null;
+  let autoCompleteTimeout = null;
+  let currentAutoCompleteField = null;
+
+  function setupAutoComplete() {
+    // Find all text inputs and textareas
+    const textFields = detectedFields.filter(f => {
+      const type = f.element.type;
+      return type === 'text' || type === 'textarea' || f.element.tagName === 'TEXTAREA';
+    });
+    
+    textFields.forEach(field => {
+      field.element.addEventListener('input', (e) => handleAutoCompleteInput(e, field));
+      field.element.addEventListener('blur', () => {
+        // Delay hiding to allow click on dropdown
+        setTimeout(hideAutoComplete, 200);
+      });
+    });
+  }
+
+  async function handleAutoCompleteInput(event, field) {
+    const text = event.target.value;
+    
+    // Only trigger if text is long enough and ends with space
+    if (text.length < 10 || !text.endsWith(' ')) {
+      hideAutoComplete();
+      return;
+    }
+    
+    // Debounce API calls
+    clearTimeout(autoCompleteTimeout);
+    autoCompleteTimeout = setTimeout(async () => {
+      await requestAutoComplete(field, text.trim());
+    }, 500);
+  }
+
+  async function requestAutoComplete(field, currentText) {
+    const geminiApiKey = settings?.geminiApiKey;
+    if (!geminiApiKey) return;
+    
+    currentAutoCompleteField = field;
+    
+    try {
+      const fieldContext = {
+        fieldName: field.fieldKey,
+        currentText: currentText,
+        formType: 'general',
+        profileHints: storedData?.professional?.bio || storedData?.personal?.fullName || ''
+      };
+      
+      const response = await chrome.runtime.sendMessage({
+        action: 'generateAutoComplete',
+        fieldContext,
+        apiKey: geminiApiKey
+      });
+      
+      if (response.success && response.result && response.result.length > 0) {
+        showAutoComplete(field.element, response.result, currentText);
+      }
+    } catch (error) {
+      console.error('Auto-complete error:', error);
+    }
+  }
+
+  function showAutoComplete(element, suggestions, currentText) {
+    hideAutoComplete();
+    
+    autoCompleteDropdown = document.createElement('div');
+    autoCompleteDropdown.className = 'sff-autocomplete-dropdown';
+    autoCompleteDropdown.innerHTML = suggestions.map((suggestion, idx) => `
+      <div class="sff-autocomplete-item" data-index="${idx}">
+        <span class="sff-autocomplete-icon">✨</span>
+        <span class="sff-autocomplete-text">${suggestion}</span>
+      </div>
+    `).join('');
+    
+    // Position dropdown
+    const rect = element.getBoundingClientRect();
+    autoCompleteDropdown.style.top = (rect.bottom + window.scrollY) + 'px';
+    autoCompleteDropdown.style.left = rect.left + 'px';
+    autoCompleteDropdown.style.width = rect.width + 'px';
+    
+    document.body.appendChild(autoCompleteDropdown);
+    
+    // Add click handlers
+    autoCompleteDropdown.querySelectorAll('.sff-autocomplete-item').forEach((item, idx) => {
+      item.addEventListener('click', () => {
+        element.value = currentText + suggestions[idx];
+        element.dispatchEvent(new Event('input', { bubbles: true }));
+        hideAutoComplete();
+      });
+    });
+  }
+
+  function hideAutoComplete() {
+    if (autoCompleteDropdown) {
+      autoCompleteDropdown.remove();
+      autoCompleteDropdown = null;
+    }
+  }
+
+
+
+  // AI-Powered batch scan of all unidentified fields
+  async function aiScanPage() {
+    const apiKey = settings?.geminiApiKey;
+    if (!apiKey) {
+      showToast('Please add your Gemini API key in settings first.', 'info');
+      return;
+    }
+
+    // Collect all inputs that were NOT identified by regex
+    const allInputs = getAllInputs(document);
+    const unknownInputs = allInputs.filter(input => {
+      if (shouldSkipInput(input)) return false;
+      return !detectedFields.some(f => f.element === input);
+    });
+
+    if (unknownInputs.length === 0) {
+      showToast('No new fields to analyze.', 'info');
+      return;
+    }
+
+    // Prepare fields for AI (subset for efficiency)
+    const fieldsToAnalyze = unknownInputs.slice(0, 15).map(input => ({
+      label: getFieldLabel(input),
+      placeholder: input.placeholder || '',
+      name: input.name || '',
+      id: input.id || ''
+    }));
+
+    try {
+      const response = await chrome.runtime.sendMessage({
+        action: 'analyzePageFields',
+        fields: fieldsToAnalyze,
+        apiKey: apiKey
+      });
+
+      if (response.success && response.results) {
+        let addedCount = 0;
+        Object.entries(response.results).forEach(([idx, fieldKey]) => {
+          if (fieldKey !== 'unknown') {
+            const input = unknownInputs[parseInt(idx)];
+            if (input) {
+              detectedFields.push({
+                element: input,
+                fieldKey: fieldKey,
+                category: suggestCategory(fieldKey), // Local helper
+                label: getFieldLabel(input),
+                originalIdentifier: 'ai-matched'
+              });
+              addedCount++;
+            }
+          }
+        });
+        
+        if (addedCount > 0) {
+          removeMagicFillIcons();
+          injectMagicFillIcons();
+        }
+      }
+    } catch (error) {
+      console.error('AI Scan Error:', error);
+      throw error;
+    }
+  }
+
+  // Refresh all magic icons on the page (e.g. after profile switch or data update)
+  function refreshMagicIcons() {
+    removeMagicFillIcons();
+    injectMagicFillIcons();
+  }
+
+  // Simple category suggestion for AI matches
+  function suggestCategory(key) {
+    if (['firstName', 'lastName', 'fullName', 'dob', 'gender'].includes(key)) return 'personal';
+    if (['email', 'phone'].includes(key)) return 'contact';
+    if (['street', 'city', 'state', 'zip', 'country'].includes(key)) return 'address';
+    if (['university', 'degree', 'graduationYear'].includes(key)) return 'education';
+    if (['company', 'jobTitle', 'linkedin'].includes(key)) return 'professional';
+    return 'other';
   }
 
 })();

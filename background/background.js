@@ -18,6 +18,7 @@ chrome.runtime.onInstalled.addListener(async (details) => {
         showConfirmation: true,
         learnFromForms: true,
         showHUD: true,
+        showMagicIcon: true,
         geminiApiKey: ''
       }
     });
@@ -98,6 +99,27 @@ function formatFieldName(name) {
     .split(' ').map(s => s.charAt(0).toUpperCase() + s.slice(1)).join(' ');
 }
 
+// Test Gemini Connection
+async function testGeminiConnection(apiKey) {
+  if (!apiKey) return { success: false, error: 'API Key is required' };
+  try {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: 'Say "Connection successful"' }] }]
+      })
+    });
+    if (!response.ok) {
+      const data = await response.json();
+      return { success: false, error: data.error?.message || 'Connection failed' };
+    }
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
 // Listen for messages
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   handleMessage(request, sender, sendResponse);
@@ -133,8 +155,12 @@ async function triggerFillingInActiveTab() {
 }
 
 // Handle messages
+const GEMINI_MODEL = 'gemini-3-flash-preview';
+
 async function handleMessage(request, sender, sendResponse) {
   try {
+    const apiKey = request.apiKey;
+    
     switch (request.action) {
       case 'dataUpdated':
         await broadcastDataUpdate(request.formData, request.settings);
@@ -142,12 +168,12 @@ async function handleMessage(request, sender, sendResponse) {
         break;
 
       case 'analyzeFields':
-        const results = await analyzeFieldsWithGemini(request.fields, request.apiKey);
+        const results = await analyzeFieldsWithGemini(request.fields, apiKey);
         sendResponse({ success: true, results });
         break;
 
       case 'suggestCategory':
-        const category = await suggestCategoryWithGemini(request.fieldName, request.apiKey);
+        const category = await suggestCategoryWithGemini(request.fieldName, apiKey);
         sendResponse({ success: true, category });
         break;
 
@@ -157,22 +183,22 @@ async function handleMessage(request, sender, sendResponse) {
         break;
 
       case 'validateFormFields':
-        const validated = await validateFormFieldsWithGemini(request.fields, request.apiKey);
+        const validated = await validateFormFieldsWithGemini(request.fields, apiKey);
         sendResponse({ success: true, results: validated });
         break;
 
       case 'generateField':
-        const generatedText = await generateFieldWithGemini(request.field, request.profileData, request.apiKey);
+        const generatedText = await generateFieldWithGemini(request.field, request.profileData, apiKey);
         sendResponse({ success: true, result: generatedText });
         break;
 
       case 'extractFromDocument':
-        const docResult = await extractFromDocumentWithGemini(request.fileData, request.mimeType, request.apiKey);
+        const docResult = await extractFromDocumentWithGemini(request.fileData, request.mimeType, apiKey);
         sendResponse({ success: true, result: docResult });
         break;
 
       case 'generateCoverLetter':
-        const letter = await generateCoverLetterWithGemini(request.jobDescription, request.profileData, request.tone, request.apiKey);
+        const letter = await generateCoverLetterWithGemini(request.jobDescription, request.profileData, request.tone, apiKey);
         sendResponse({ success: true, result: letter });
         break;
 
@@ -183,15 +209,44 @@ async function handleMessage(request, sender, sendResponse) {
         break;
 
       case 'extractFromUrl':
-        const urlResult = await extractFromUrlWithGemini(request.url, request.apiKey);
+        const urlResult = await extractFromUrlWithGemini(request.url, apiKey);
         sendResponse({ success: true, result: urlResult });
+        break;
+
+      case 'analyzeFormContext':
+        const formAnalysis = await analyzeFormContext(request.formData, apiKey);
+        sendResponse({ success: true, result: formAnalysis });
+        break;
+
+      case 'generateAutoComplete':
+        const suggestions = await generateAutoComplete(request.fieldContext, apiKey);
+        sendResponse({ success: true, result: suggestions });
+        break;
+        
+      case 'optimizeProfile':
+        const optimized = await optimizeProfileDataWithGemini(request.profileData, apiKey);
+        if (optimized && optimized.error) {
+          sendResponse({ success: false, error: optimized.error });
+        } else {
+          sendResponse({ success: true, result: optimized });
+        }
+        break;
+
+      case 'analyzePageFields':
+        const pageResults = await analyzePageFieldsWithGemini(request.fields, apiKey);
+        sendResponse({ success: true, results: pageResults });
+        break;
+
+      case 'testApiKey':
+        const testResult = await testGeminiConnection(apiKey);
+        sendResponse(testResult);
         break;
 
       default:
         sendResponse({ success: false, error: 'Unknown action' });
     }
   } catch (error) {
-    console.error('Background error:', error);
+    console.error('Background message error:', error);
     sendResponse({ success: false, error: error.message });
   }
 }
@@ -240,7 +295,7 @@ Example response: {"1": "firstName", "2": "email", "3": "unknown"}
 Return ONLY the JSON object, no other text.`;
 
   try {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`, {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -298,7 +353,7 @@ async function suggestCategoryWithGemini(fieldName, apiKey) {
 Reply with ONLY one word from: personal, contact, address, education, professional, other`;
 
   try {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`, {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -351,7 +406,7 @@ Rules:
 - Return ONLY the JSON object, no markdown, no explanation.`;
 
   try {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`, {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -401,7 +456,7 @@ Rules:
 - Return ONLY the generated text, no explanation or conversational filler.`;
 
   try {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`, {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -430,7 +485,7 @@ Return the data as a structured JSON object with categories: personal, contact, 
 Only include fields you are confident about. Return VALID JSON only.`;
 
   try {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`, {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -472,13 +527,36 @@ async function extractFromUrlWithGemini(url, apiKey) {
   if (!apiKey) return null;
 
   const prompt = `Visit or analyze this LinkedIn profile URL: ${url}
-Extract: Name, Current Role, Current Company, Education, and Skills.
-Return the data as a structured JSON object with categories: personal, professional, education.
-If you cannot access the link, extract whatever possible from the URL structure or common knowledge if it's a public figure, otherwise return empty JSON.
-Return VALID JSON only.`;
+Extract as much information as possible.
+Break down composite fields into granular parts and return them ALL in the following structure:
+
+- personal: { 
+    fullName, firstName, lastName, middleName (if any), 
+    jobTitle, headline, bio_summary 
+  }
+- contact: { 
+    email, phone, linkedin_url, website, twitter, github 
+  }
+- professional: { 
+    current_company, company_website, 
+    experience: [ { company, title, duration, description } ] 
+  }
+- education: { 
+    university, degree, major, graduation_year, 
+    schools: [ { school, degree, fieldOfStudy, dates } ] 
+  }
+- address: {
+    city, state, country, zip (if inferrable)
+  }
+- other: {
+    skills (comma separated list), languages
+  }
+
+If you cannot access the link directly, use the URL structure and your knowledge base to extract as much as possible.
+Return VALID JSON only. Ensure you provide BOTH the full name AND the first/last names separately.`;
 
   try {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`, {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -519,7 +597,7 @@ async function generateCoverLetterWithGemini(jobDescription, profileData, tone, 
   `;
 
   try {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`, {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -535,5 +613,185 @@ async function generateCoverLetterWithGemini(jobDescription, profileData, tone, 
   } catch (error) {
     console.error('Cover Letter Gen Error:', error);
     return `Error generating cover letter: ${error.message}`;
+  }
+}
+
+// Intelligent Form Understanding
+async function analyzeFormContext(formData, apiKey) {
+  if (!apiKey || !formData) return null;
+  
+  const prompt = `Analyze this web form and provide insights:
+
+Page Title: ${formData.pageTitle}
+Page URL: ${formData.pageUrl}
+Form Fields: ${formData.fields.join(', ')}
+Field Labels: ${JSON.stringify(formData.labels)}
+
+Determine:
+1. Form Purpose (job_application, contact_form, registration, survey, checkout, other)
+2. Recommended Profile (personal, work, job_apps)
+3. Industry/Domain (tech, finance, healthcare, education, retail, other)
+4. Confidence Level (0-100)
+
+Return ONLY JSON:
+{
+  "formType": "...",
+  "recommendedProfile": "...",
+  "industry": "...",
+  "confidence": number,
+  "reasoning": "brief explanation"
+}`;
+
+  try {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.2, maxOutputTokens: 300 }
+      })
+    });
+
+    if (!response.ok) return null;
+
+    const data = await response.json();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+    const jsonMatch = text?.match(/\{[\s\S]*\}/);
+    
+    return jsonMatch ? JSON.parse(jsonMatch[0]) : null;
+  } catch (error) {
+    console.error('Form context analysis error:', error);
+    return null;
+  }
+}
+
+// Auto-Complete Suggestions
+async function generateAutoComplete(fieldContext, apiKey) {
+  if (!apiKey || !fieldContext.currentText) return null;
+  
+  const prompt = `Complete this sentence naturally and professionally:
+
+Field: ${fieldContext.fieldName}
+Current text: "${fieldContext.currentText}"
+Context: ${fieldContext.formType || 'general form'}
+User profile hints: ${fieldContext.profileHints || ''}
+
+Provide 2-3 short completion suggestions (10-30 words each).
+Return ONLY JSON array: ["suggestion 1", "suggestion 2", "suggestion 3"]`;
+
+  try {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.7, maxOutputTokens: 200 }
+      })
+    });
+
+    if (!response.ok) return null;
+
+    const data = await response.json();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+    const jsonMatch = text?.match(/\[[\s\S]*\]/);
+    
+    return jsonMatch ? JSON.parse(jsonMatch[0]) : null;
+  } catch (error) {
+    console.error('Auto-complete error:', error);
+    return null;
+  }
+}
+// Optimize existing profile data - cleanup, splitting, and categorization
+async function optimizeProfileDataWithGemini(profileData, apiKey) {
+  if (!apiKey || !profileData) return null;
+
+  const prompt = `You are a data cleaning expert for a browser extension. 
+I have a user's profile data that needs cleaning and optimization:
+${JSON.stringify(profileData)}
+
+Please perform the following:
+1. Break down composite fields into specific ones (e.g., if Name is "Aman Anand", add firstName: "Aman" and lastName: "Anand").
+2. Re-categorize fields into (personal, contact, address, education, professional, other) if they are misplaced.
+3. Standardize formatting (Proper Case for names, consistent phone formats).
+4. If address is a single string, split it into street, city, state, zip.
+5. DE-DUPLICATE: Remove redundant fields that mean the same thing.
+
+Return the FULL OPTIMIZED profile as a structured JSON object.
+Return VALID JSON ONLY. No explanation.`;
+
+  try {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { 
+          temperature: 0.1, 
+          response_mime_type: "application/json" 
+        }
+      })
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      return { error: errorData.error?.message || `API Error: ${response.status}` };
+    }
+
+    const data = await response.json();
+    const resultText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    
+    if (!resultText) return { error: 'Empty response from AI' };
+    
+    try {
+      // Handle cases where AI might wrap JSON in markdown blocks
+      const jsonMatch = resultText.match(/\{[\s\S]*\}/);
+      return JSON.parse(jsonMatch ? jsonMatch[0] : resultText);
+    } catch (parseError) {
+      console.error('JSON Parse Error:', parseError, resultText);
+      return { error: 'Failed to parse AI response as JSON' };
+    }
+  } catch (error) {
+    console.error('Profile optimization error:', error);
+    return { error: error.message };
+  }
+}
+
+// Analyze all fields on a page at once using Gemini
+async function analyzePageFieldsWithGemini(fields, apiKey) {
+  if (!apiKey || !fields?.length) return {};
+
+  const prompt = `You are a form expert. I have a list of form fields from a webpage.
+Identify which piece of personal data each field expects.
+Fields:
+${JSON.stringify(fields.map((f, i) => ({ id: i, label: f.label, placeholder: f.placeholder, name: f.name })))}
+
+Possible data types: firstName, lastName, fullName, email, phone, street, city, state, zip, country, company, jobTitle, university, degree, graduationYear, skills, bio.
+
+Return a JSON mapping of { "field_id": "data_type" }.
+If a field is unclear, use "unknown".
+Return ONLY VALID JSON.`;
+
+  try {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { 
+          temperature: 0.1, 
+          response_mime_type: "application/json" 
+        }
+      })
+    });
+
+    if (!response.ok) return {};
+
+    const data = await response.json();
+    const resultText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    const jsonMatch = resultText?.match(/\{[\s\S]*\}/);
+    return JSON.parse(jsonMatch ? jsonMatch[0] : resultText || '{}');
+  } catch (error) {
+    console.error('Page analysis error:', error);
+    return {};
   }
 }

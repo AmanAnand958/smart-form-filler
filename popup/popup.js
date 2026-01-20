@@ -224,10 +224,161 @@ async function loadProfiles() {
   }
 }
 
+// === Version History Functions ===
+
+async function saveToHistory(profileName, data) {
+  const historyKey = `profileHistory_${profileName}`;
+  const result = await chrome.storage.local.get(historyKey);
+  const history = result[historyKey] || [];
+  
+  // Create snapshot
+  const snapshot = {
+    timestamp: Date.now(),
+    data: JSON.parse(JSON.stringify(data)), // deep copy
+    fieldCount: countFields(data)
+  };
+  
+  history.unshift(snapshot);
+  
+  // Keep only last 4
+  if (history.length > 4) history.pop();
+  
+  await chrome.storage.local.set({ [historyKey]: history });
+}
+
+async function loadHistory(profileName) {
+  const historyKey = `profileHistory_${profileName}`;
+  const result = await chrome.storage.local.get(historyKey);
+  return result[historyKey] || [];
+}
+
+async function restoreFromHistory(profileName, timestamp) {
+  const history = await loadHistory(profileName);
+  const snapshot = history.find(s => s.timestamp === timestamp);
+  
+  if (!snapshot) {
+    showStatus('Version not found', 'error');
+    return;
+  }
+  
+  // Restore the data (deep copy)
+  formData = JSON.parse(JSON.stringify(snapshot.data));
+  
+  // Save WITHOUT creating a new history entry
+  const now = new Date().toISOString();
+  formData.updatedAt = now;
+  
+  if (settings?.guestMode) {
+    // Guest mode: save directly to formData
+    await chrome.storage.local.set({ formData });
+    chrome.runtime.sendMessage({ 
+      action: 'dataUpdated', 
+      formData, 
+      settings 
+    }).catch(() => {});
+  } else {
+    // Normal mode: save to profiles
+    profiles[currentProfile] = formData;
+    await chrome.storage.local.set({ profiles, currentProfile });
+    
+    if (syncService) {
+      syncService.queueSync('update_profile', { formData, profiles, updatedAt: now });
+    } else {
+      syncToCloud();
+    }
+  }
+  
+  // Refresh UI (but don't update history since we didn't modify it)
+  renderLearnedFields();
+  updateFieldCount();
+  renderVersionHistory();
+  showStatus('✅ Profile restored successfully!', 'success');
+}
+
+function countFields(data) {
+  let count = 0;
+  for (const category in data) {
+    if (typeof data[category] === 'object' && !Array.isArray(data[category])) {
+      count += Object.keys(data[category]).length;
+    }
+  }
+  return count;
+}
+
+function formatRelativeTime(timestamp) {
+  const now = Date.now();
+  const diff = now - timestamp;
+  const minutes = Math.floor(diff / 60000);
+  const hours = Math.floor(diff / 3600000);
+  const days = Math.floor(diff / 86400000);
+  
+  if (minutes < 1) return 'Just now';
+  if (minutes < 60) return `${minutes} min${minutes > 1 ? 's' : ''} ago`;
+  if (hours < 24) return `${hours} hour${hours > 1 ? 's' : ''} ago`;
+  return `${days} day${days > 1 ? 's' : ''} ago`;
+}
+
+async function renderVersionHistory() {
+  const profileName = settings?.guestMode ? 'guest' : currentProfile;
+  const history = await loadHistory(profileName);
+  
+  const container = document.getElementById('versionHistoryList');
+  
+  if (!container) return;
+  
+  if (history.length === 0) {
+    container.innerHTML = '<p style="color: #6b7280; font-size: 12px; text-align: center;">No history available</p>';
+    return;
+  }
+  
+  container.innerHTML = history.map((snapshot, index) => `
+    <div class="version-item">
+      <div class="version-info">
+        <span class="version-time">${formatRelativeTime(snapshot.timestamp)}</span>
+        <span class="version-fields">${snapshot.fieldCount} field${snapshot.fieldCount !== 1 ? 's' : ''}</span>
+      </div>
+      <button class="version-restore-btn" data-timestamp="${snapshot.timestamp}">
+        Restore
+      </button>
+    </div>
+  `).join('');
+  
+  // Attach listeners
+  container.querySelectorAll('.version-restore-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      const timestamp = parseInt(e.target.dataset.timestamp);
+      if (confirm('Restore to this version? This will replace your current data.')) {
+        restoreFromHistory(profileName, timestamp);
+      }
+    });
+  });
+}
+
 // Save current profile
 async function saveCurrentProfile() {
   const now = new Date().toISOString();
   formData.updatedAt = now;
+  
+  // Determine profile name for history
+  const profileName = settings?.guestMode ? 'guest' : currentProfile;
+  
+  // Save to history before persisting (so we can restore to current state)
+  await saveToHistory(profileName, formData);
+  
+  // In guest mode, save directly to formData
+  if (settings?.guestMode) {
+    await chrome.storage.local.set({ formData });
+    // Broadcast update to content scripts
+    chrome.runtime.sendMessage({ 
+      action: 'dataUpdated', 
+      formData, 
+      settings 
+    }).catch(() => {});
+    renderVersionHistory(); // Update history UI
+    return;
+  }
+  
+  // In normal mode, save to profiles
   profiles[currentProfile] = formData;
   await chrome.storage.local.set({ profiles, currentProfile });
   
@@ -236,6 +387,8 @@ async function saveCurrentProfile() {
   } else {
     syncToCloud();
   }
+  
+  renderVersionHistory(); // Update history UI
 }
 
 // Render profile options
@@ -1146,6 +1299,7 @@ function setupEventListeners() {
   document.getElementById('lockProfileBtn').addEventListener('click', toggleLockProfile);
   document.getElementById('shareProfileBtn')?.addEventListener('click', shareProfile);
   document.getElementById('siteEnabled')?.addEventListener('change', toggleSiteEnabled);
+  document.getElementById('optimizeDataBtn')?.addEventListener('click', handleOptimizeData);
   
   // Templates
   document.querySelectorAll('.template-card').forEach(card => {
@@ -2041,4 +2195,50 @@ function escapeHtml(text) {
   const div = document.createElement('div');
   div.textContent = text;
   return div.innerHTML;
+}
+async function handleOptimizeData() {
+  if (!settings?.geminiApiKey) {
+    showStatus('Gemini API key is required for optimization.', 'error');
+    return;
+  }
+
+  const btn = document.getElementById('optimizeDataBtn');
+  const loader = document.getElementById('optimizationLoader');
+  
+  if (!confirm('This will use AI to reorganize, split, and clean up all fields in your current profile. Proceed?')) {
+    return;
+  }
+
+  btn.disabled = true;
+  loader.classList.remove('hidden');
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      action: 'optimizeProfile',
+      profileData: formData,
+      apiKey: settings.geminiApiKey
+    });
+
+    if (response.success && response.result) {
+      // Update local formData with optimized result
+      formData = response.result;
+      
+      // Save and sync
+      await saveCurrentProfile();
+      
+      // Refresh UI
+      renderLearnedFields();
+      updateFieldCount();
+      showStatus('Profile optimized and split successfully!', 'success');
+    } else {
+      const errorMsg = response.error || 'Optimization failed. Check your API key.';
+      showStatus(`❌ ${errorMsg}`, 'error');
+    }
+  } catch (error) {
+    console.error('Optimization error:', error);
+    showStatus('Error during optimization.', 'error');
+  } finally {
+    btn.disabled = false;
+    loader.classList.add('hidden');
+  }
 }
