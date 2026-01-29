@@ -226,8 +226,10 @@
           
           <div class="form-group">
             <label for="linkedinUrl">LinkedIn Profile Link</label>
-            <input type="text" id="linkedinUrl" placeholder="https://www.linkedin.com/in/username" style="width: 100%; min-width: 250px;">
-            <button id="extractUrlBtn" class="btn btn-primary btn-small" style="margin-top: 8px; width: 100%;">✨ Extract Data</button>
+            <div class="input-with-btn">
+              <input type="text" id="linkedinUrl" placeholder="https://www.linkedin.com/in/username">
+              <button id="extractUrlBtn" class="btn btn-primary btn-small">Extract</button>
+            </div>
           </div>
         </div>
 
@@ -323,26 +325,6 @@
           </div>
         </div>
 
-        <!-- Data Optimization -->
-        <div class="settings-section">
-          <h4>Data Intelligence</h4>
-          <p class="section-desc">Clean up manual or legacy data using Gemini AI.</p>
-          <button id="optimizeDataBtn" class="btn btn-primary full-width">✨ Optimize Profile with AI</button>
-          <div id="optimizationLoader" class="loader-container hidden">
-            <div class="loader-small"></div>
-            <span>Analyzing & splitting fields...</span>
-          </div>
-        </div>
-
-        <!-- Version History -->
-        <div class="settings-section">
-          <h4>Version History</h4>
-          <p class="section-desc">Restore from the last 4 saved versions of your profile.</p>
-          <div id="versionHistoryList" class="version-history-list">
-            <p style="color: #6b7280; font-size: 12px; text-align: center;">No history available</p>
-          </div>
-        </div>
-
         <div class="settings-section">
           <h4>Backup & Restore</h4>
           <div class="backup-actions">
@@ -374,12 +356,6 @@
               Show Magic Fill Icon
             </label>
           </div>
-          <div class="form-group checkbox-group">
-            <label>
-              <input type="checkbox" id="showHUD" checked>
-              Show Floating HUD
-            </label>
-          </div>
           <div class="form-group" style="margin-top: 8px;">
             <label for="magicIconBehavior" style="font-size: 12px;">Icon Behavior</label>
             <select id="magicIconBehavior" class="select-small">
@@ -389,6 +365,18 @@
             </select>
           </div>
         </div>
+
+        <!-- Data Management -->
+        <div class="settings-section">
+          <h4>Data</h4>
+          <div class="actions">
+            <button id="exportData" class="btn btn-secondary">📤 Export</button>
+            <button id="importData" class="btn btn-secondary">📥 Import</button>
+            <button id="clearData" class="btn btn-danger">🗑️ Clear</button>
+          </div>
+        </div>
+        <input type="file" id="importFile" accept=".json" class="hidden">
+
 
         <!-- Onboarding -->
         <div class="settings-section">
